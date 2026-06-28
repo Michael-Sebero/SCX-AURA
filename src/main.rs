@@ -762,11 +762,14 @@ impl<'a> Scheduler<'a> {
             nr_interactive_dispatches:          bss.nr_interactive_dispatches,
             nr_background_dispatches:           bss.nr_background_dispatches,
             nr_warp_dispatches:                 bss.nr_warp_dispatches,
+            nr_default_warp_dispatches:         bss.nr_default_warp_dispatches,
             nr_iact_promoted:                   bss.nr_iact_promoted,
             nr_iact_demoted:                    bss.nr_iact_demoted,
             nr_ecore_consolidations:            bss.nr_ecore_consolidations,
+            nr_ecore_rebalance_pulls:           bss.nr_ecore_rebalance_pulls,
             nr_preempt_kicks:                   bss.nr_preempt_kicks,
             nr_wcel_enforcements:               bss.nr_wcel_enforcements,
+            nr_starvation_window_opens:         bss.nr_starvation_window_opens,
         }
     }
 

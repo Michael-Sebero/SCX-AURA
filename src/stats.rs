@@ -87,18 +87,24 @@ pub struct Metrics {
     pub nr_interactive_dispatches: u64,
     #[stat(desc = "Number of background-tier dispatches from the tier DSQ")]
     pub nr_background_dispatches: u64,
-    #[stat(desc = "Number of dispatches via the per-CPU warp window")]
+    #[stat(desc = "Number of interactive-tier dispatches via the depleting warp budget (ahead of EDF)")]
     pub nr_warp_dispatches: u64,
+    #[stat(desc = "Number of default-tier dispatches via the depleting warp budget (ahead of background)")]
+    pub nr_default_warp_dispatches: u64,
     #[stat(desc = "Number of process groups promoted to interactive tier by scorer")]
     pub nr_iact_promoted: u64,
     #[stat(desc = "Number of process groups demoted to background tier by scorer")]
     pub nr_iact_demoted: u64,
     #[stat(desc = "Number of times an E-core was skipped to consolidate idle")]
     pub nr_ecore_consolidations: u64,
+    #[stat(desc = "Number of times an idle P-core pulled queued work back from an E-core (passive rebalance)")]
+    pub nr_ecore_rebalance_pulls: u64,
     #[stat(desc = "Number of SCX_KICK_PREEMPT kicks issued to displace lower-tier tasks (F8)")]
     pub nr_preempt_kicks: u64,
-    #[stat(desc = "Number of times WCEL enforcement forced a tier to win dispatch (starvation avoidance)")]
+    #[stat(desc = "Number of times WCEL enforcement forced a tier to win dispatch (unconditional, or within an open starvation-avoidance window)")]
     pub nr_wcel_enforcements: u64,
+    #[stat(desc = "Number of fresh bounded starvation-avoidance windows opened (a tier was aged-out while a higher tier was also runnable)")]
+    pub nr_starvation_window_opens: u64,
 }
 
 impl Metrics {
@@ -107,9 +113,9 @@ impl Metrics {
             w,
             "[{}] r:{:>2}/{:<2} | \
              tiers i:{:<5} d:{:<5} bg:{:<5} | \
-             warp:{:<5} kick:{:<5} wcel:{:<5} | \
+             warp:{:<5} dwarp:{:<5} kick:{:<5} wcel:{:<5} starv:{:<4} | \
              score ^:{:<4} v:{:<4} | \
-             econs:{:<4} | \
+             econs:{:<4} rebal:{:<4} | \
              timely rec:{:<5} mid:{:<5} rl:{:<5} lo:{:<5} hi:{:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
@@ -118,11 +124,14 @@ impl Metrics {
             self.nr_shared_dispatches,
             self.nr_background_dispatches,
             self.nr_warp_dispatches,
+            self.nr_default_warp_dispatches,
             self.nr_preempt_kicks,
             self.nr_wcel_enforcements,
+            self.nr_starvation_window_opens,
             self.nr_iact_promoted,
             self.nr_iact_demoted,
             self.nr_ecore_consolidations,
+            self.nr_ecore_rebalance_pulls,
             self.nr_delay_recovery_dispatches,
             self.nr_delay_middle_add_dispatches,
             self.nr_delay_rate_limited_dispatches,
@@ -203,12 +212,18 @@ impl Metrics {
                 - rhs.nr_background_dispatches,
             nr_warp_dispatches: self.nr_warp_dispatches
                 - rhs.nr_warp_dispatches,
+            nr_default_warp_dispatches: self.nr_default_warp_dispatches
+                - rhs.nr_default_warp_dispatches,
             nr_iact_promoted: self.nr_iact_promoted - rhs.nr_iact_promoted,
             nr_iact_demoted: self.nr_iact_demoted - rhs.nr_iact_demoted,
             nr_ecore_consolidations: self.nr_ecore_consolidations
                 - rhs.nr_ecore_consolidations,
+            nr_ecore_rebalance_pulls: self.nr_ecore_rebalance_pulls
+                - rhs.nr_ecore_rebalance_pulls,
             nr_preempt_kicks: self.nr_preempt_kicks - rhs.nr_preempt_kicks,
             nr_wcel_enforcements: self.nr_wcel_enforcements - rhs.nr_wcel_enforcements,
+            nr_starvation_window_opens: self.nr_starvation_window_opens
+                - rhs.nr_starvation_window_opens,
             ..self.clone()
         }
     }

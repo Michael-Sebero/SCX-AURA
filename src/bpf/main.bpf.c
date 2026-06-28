@@ -2,20 +2,32 @@
 /*
  * Copyright (c) 2024 Andrea Righi <andrea.righi@linux.dev>
  *
- * scx_aura — laptop-optimised sched_ext scheduler with full XNU Clutch
- * feature parity:
+ * scx_aura — laptop-optimised sched_ext scheduler porting XNU Clutch's
+ * interactive and battery-saving mechanisms onto a simplified 3-tier
+ * model. Deliberately not full Clutch parity (3 tiers instead of 6, no
+ * bound/unbound hierarchy, no AMP cluster spill/steal) — see the
+ * per-mechanism notes below for what each one does and does not cover:
  *
  *  Three-tier scheduling (TIER_INTERACTIVE / DEFAULT / BACKGROUND) with
  *  correct cross-tier EDF via per-tier vtime base offsets.
  *
  *  Per-process-group interactivity scoring (XNU Clutch bucket scoring).
  *
- *  Warp dispatch — interactive tier preempts EDF for an 8 ms window,
- *  matching XNU FG warp budget.
+ *  Warp dispatch — per-tier depleting warp budget (INTERACTIVE: 8 ms,
+ *  DEFAULT: 2 ms, BACKGROUND: 0 ms) lets a higher tier jump ahead of EDF,
+ *  but the budget only refills when that tier next wins the EDF race
+ *  fairly (on deadline alone). A tier with continuous arrivals cannot
+ *  warp forever, matching XNU's bounded warp semantics and avoiding
+ *  indefinite starvation of lower tiers.
  *
  *  Per-tier WCEL (Worst-Case Execution Latency) enforcement: a tier that
  *  has been waiting longer than its budget gets its deadline zeroed so it
- *  wins the next dispatch unconditionally, matching XNU starvation avoidance.
+ *  wins dispatch.  If nothing higher is runnable this is unconditional,
+ *  matching XNU's natural-order selection.  If a higher tier IS also
+ *  runnable, the override is bounded to one starvation-avoidance quantum
+ *  (re-opened each time the tier is still starved afterward), matching
+ *  XNU's actual bounded starvation-avoidance window rather than letting
+ *  the lower tier monopolize the CPU for as long as its head stays old.
  *    TIER_INTERACTIVE:  0 ms  (always runs as soon as a CPU is free)
  *    TIER_DEFAULT:     75 ms
  *    TIER_BACKGROUND: 250 ms
@@ -87,8 +99,54 @@
 #define WCEL_DEFAULT_NS		(75ULL  * NSEC_PER_MSEC)
 #define WCEL_BACKGROUND_NS	(250ULL * NSEC_PER_MSEC)
 
-/* Warp window: interactive tier preempts EDF for up to 8 ms. */
-#define WARP_WINDOW_NS		(8ULL * NSEC_PER_MSEC)
+/*
+ * Per-tier starvation-avoidance quantum (XNU analogue:
+ * sched_clutch_thread_quantum[bucket], used as the bounded window length
+ * in sched_clutch_root_highest_root_bucket()'s starvation-avoidance path).
+ *
+ * XNU populates this table from the standard Mach timeshare quantum
+ * (~10 ms) uniformly across buckets at scheduler init.  scx_aura's
+ * slice_max defaults to 1 ms — roughly an order of magnitude shorter,
+ * consistent with how WCEL_*_NS and WARP_BUDGET_*_NS above were already
+ * scaled down from XNU's literal values for this scheduler's much
+ * shorter base slice.  We follow the same proportion here rather than
+ * hardcode XNU's literal 10 ms, which would be disproportionately long
+ * relative to this scheduler's tick granularity.
+ *
+ * TIER_INTERACTIVE never needs a starvation-avoidance window (nothing
+ * sits above it to starve it), so it has no quantum entry.
+ */
+#define STARVATION_QUANTUM_DEFAULT_NS		(1ULL * NSEC_PER_MSEC)
+#define STARVATION_QUANTUM_BACKGROUND_NS	(1ULL * NSEC_PER_MSEC)
+
+/*
+ * Per-tier warp budgets (XNU analogue: sched_clutch_root_bucket_warp_us[]).
+ *
+ * XNU values: FG = 8 ms, IN = 4 ms, DF = 2 ms, UT = 1 ms, BG = 0 ms.
+ * Mapped to our three tiers (INTERACTIVE warps over DEFAULT/BACKGROUND;
+ * DEFAULT warps over BACKGROUND only; BACKGROUND never warps):
+ *   INTERACTIVE: 8 ms  — maps to XNU FG.
+ *   DEFAULT:     2 ms  — maps to XNU DF.
+ *   BACKGROUND:  0 ms  — maps to XNU BG (no warp).
+ *
+ * Unlike a fixed sliding window, this is a *depleting* budget: it is only
+ * refilled when the tier wins its EDF race fairly (i.e. on deadline alone,
+ * not because it was already warping), and it drains in real time while
+ * being spent.  Once exhausted the tier cannot warp again until it next
+ * wins normally.  This matches XNU's starvation-bounded warp semantics and
+ * prevents a tier with continuous arrivals from warping forever.
+ */
+#define WARP_BUDGET_INTERACTIVE_NS	(8ULL * NSEC_PER_MSEC)
+#define WARP_BUDGET_DEFAULT_NS		(2ULL * NSEC_PER_MSEC)
+#define WARP_BUDGET_BACKGROUND_NS	0ULL
+
+/*
+ * Max retries for the CAS loop that charges tier_warp_remaining_ns[].
+ * Bounded so the BPF verifier can prove termination; under realistic
+ * contention (at most nr_cpu_ids concurrent dispatch() callers racing on
+ * one tier's budget) this is generously above worst case.
+ */
+#define WARP_CAS_MAX_RETRY		16
 
 /* Group interactivity scoring window and parameters. */
 #define IACT_WINDOW_NS		(500ULL * NSEC_PER_MSEC)
@@ -205,6 +263,51 @@ static u64 tier_wcel_ns[NR_TIERS];
  */
 static volatile u64 tier_enqueue_ts[NR_TIERS];
 
+/*
+ * Per-tier warp budget table, populated in aura_init from
+ * WARP_BUDGET_*_NS.  BACKGROUND's budget is always 0 (lowest tier never
+ * warps over anything).
+ */
+static u64 tier_warp_budget_ns[NR_TIERS];
+
+/*
+ * Per-tier warp accounting (XNU analogue: scrb_warp_remaining /
+ * scrb_warped_deadline in sched_clutch_root_bucket).
+ *
+ * tier_warp_remaining_ns[t]: budget left for tier t to warp ahead of EDF.
+ *   Drained in real time while a warp window for t is open; refilled to
+ *   the full per-tier budget only when t wins the EDF race *fairly*
+ *   (i.e. on deadline alone, not via warp) — see tier_warp_refill().
+ *
+ * tier_warp_window_until_ns[t]: wall-clock end of the current open warp
+ *   window for tier t, or 0 if no window is currently open.  A window is
+ *   opened lazily on first use after a tier has positive remaining budget,
+ *   and is capped to however much budget is left.
+ */
+static volatile u64 tier_warp_remaining_ns[NR_TIERS];
+static volatile u64 tier_warp_window_until_ns[NR_TIERS];
+static volatile u64 tier_warp_window_opened_ns[NR_TIERS];
+
+/*
+ * Per-tier starvation-avoidance window state (XNU analogue:
+ * scrb_starvation_avoidance / scrb_starvation_ts in
+ * sched_clutch_root_bucket).
+ *
+ * tier_starvation_active[t]: true while tier t is inside a bounded
+ *   starvation-avoidance window — i.e. it is being allowed to win
+ *   dispatch specifically *because* a higher tier is also runnable and
+ *   t would otherwise be starved, not because it won the deadline race
+ *   on its own merits.
+ *
+ * tier_starvation_ts[t]: wall-clock time the current window was opened.
+ *   The window closes after STARVATION_QUANTUM_*_NS elapses, at which
+ *   point the tier's WCEL-based deadline override is recomputed and the
+ *   decision is re-evaluated from scratch — it does not silently keep
+ *   winning forever the way an unbounded WCEL override would.
+ */
+static volatile bool tier_starvation_active[NR_TIERS];
+static volatile u64  tier_starvation_ts[NR_TIERS];
+
 /* ─── Statistics counters ──────────────────────────────────────────────── */
 
 volatile u64
@@ -229,10 +332,12 @@ volatile u64
 	nr_cpu_release_reenqueue,
 	/* laptop / XNU counters */
 	nr_interactive_dispatches, nr_background_dispatches,
-	nr_warp_dispatches, nr_iact_promoted, nr_iact_demoted,
+	nr_warp_dispatches, nr_default_warp_dispatches,
+	nr_iact_promoted, nr_iact_demoted,
 	nr_ecore_consolidations, nr_preempt_kicks,
+	nr_ecore_rebalance_pulls,
 	/* WCEL enforcement counter */
-	nr_wcel_enforcements;
+	nr_wcel_enforcements, nr_starvation_window_opens;
 
 /* ─── Per-group interactivity map ───────────────────────────────────────── */
 
@@ -260,7 +365,6 @@ struct cpu_ctx {
 	u64 tot_runtime;
 	u64 prev_runtime;
 	u64 last_running;
-	u64 warp_deadline;
 	struct bpf_cpumask __kptr *smt;
 };
 
@@ -653,28 +757,144 @@ static u64 effective_slice(struct task_ctx *tctx,
 	return task_slice(p, cpu);
 }
 
-/* ─── Per-CPU warp helpers ──────────────────────────────────────────────── */
+/*
+ * ─── Per-tier warp budget helpers ────────────────────────────────────────
+ *
+ * XNU analogue: sched_clutch_root_highest_root_bucket() warp handling in
+ * sched_clutch.c.  Real Clutch gives each scheduling bucket a *depleting*
+ * warp budget that lets it jump ahead of the EDF-selected bucket for a
+ * bounded amount of wall-clock time; the budget is only restored to full
+ * when the bucket is next selected "in natural order" (i.e. it wins the
+ * EDF race on deadline alone, without spending warp).  A tier that keeps
+ * receiving new work cannot keep warping forever — once its budget hits
+ * zero it must wait until it wins fairly before it can warp again.
+ *
+ * This intentionally differs from a fixed sliding window (the original
+ * scx_aura design): a fixed window re-arms on every new arrival and can
+ * never deplete, which lets a steady stream of interactive enqueues starve
+ * DEFAULT/BACKGROUND indefinitely — exactly the failure mode XNU's
+ * depleting-budget design exists to prevent.  Battery life depends on
+ * background/default work (compiles, indexing, backups) eventually
+ * draining so the system can go idle; an unbounded warp directly works
+ * against that.
+ */
 
-static inline bool warp_is_active(struct cpu_ctx *cctx, u64 now)
+/*
+ * tier_warp_try_consume(): attempt to spend warp budget for `tier` to
+ * cover the dispatch happening at time `now`.  Returns true if `tier` may
+ * warp ahead of EDF right now.  Lazily opens a window sized to the
+ * remaining budget on first use, then charges real elapsed time against
+ * the remaining budget on every subsequent call while the window stays
+ * open.  Once tier_warp_remaining_ns[tier] reaches 0 this always returns
+ * false until the tier is refilled by tier_warp_refill().
+ *
+ * Concurrency: tier_warp_remaining_ns[] is global state shared by every
+ * CPU's dispatch() call, not per-CPU state.  A plain READ_ONCE +
+ * WRITE_ONCE pair is not enough here — two CPUs can both read the same
+ * `remaining`, each compute their own charge, and the second writer's
+ * store silently clobbers the first, under- or double-charging the
+ * budget.  tier_warp_remaining_ns[] is therefore updated with a CAS
+ * retry loop so concurrent charges always compose correctly.
+ * tier_warp_window_until_ns[]/tier_warp_window_opened_ns[] are updated
+ * with plain stores: a lost or reordered update to those only changes
+ * exactly when the next caller re-opens or re-checks the window, which
+ * self-corrects on the next call and never lets budget be created or
+ * destroyed, unlike a race on tier_warp_remaining_ns[] itself.
+ */
+static inline bool tier_warp_try_consume(u8 tier, u64 now)
 {
-	return warp_enabled && time_before(now, cctx->warp_deadline);
+	u64 remaining, until, opened, spent, new_remaining;
+	int retry;
+
+	if (!warp_enabled || tier_warp_budget_ns[tier] == 0)
+		return false;
+
+	remaining = READ_ONCE(tier_warp_remaining_ns[tier]);
+	if (remaining == 0)
+		return false;
+
+	until = READ_ONCE(tier_warp_window_until_ns[tier]);
+	if (until == 0 || !time_before(now, until)) {
+		/* No window open (or it has lapsed): open a fresh one
+		 * sized to whatever budget remains right now.  Re-reading
+		 * `remaining` isn't needed for correctness here since we
+		 * are not charging anything yet, only recording when this
+		 * fresh window should end. */
+		WRITE_ONCE(tier_warp_window_opened_ns[tier], now);
+		WRITE_ONCE(tier_warp_window_until_ns[tier], now + remaining);
+		return true;
+	}
+
+	/*
+	 * Window already open: charge elapsed time since it was opened
+	 * (or since it was last charged) against the remaining budget, via
+	 * CAS so concurrent charges from other CPUs can't be lost.  Bounded
+	 * retry loop (not a bare `for (;;)`): the BPF verifier requires
+	 * statically provable termination, and this file's convention for
+	 * that is bpf_for() with an explicit cap, same as the kick loops
+	 * elsewhere in dispatch()/enqueue().
+	 */
+	opened = READ_ONCE(tier_warp_window_opened_ns[tier]);
+	spent  = (now > opened) ? (now - opened) : 0;
+
+	new_remaining = 0;
+	bpf_for(retry, 0, WARP_CAS_MAX_RETRY) {
+		remaining = READ_ONCE(tier_warp_remaining_ns[tier]);
+		if (remaining == 0)
+			return false;
+		new_remaining = (spent >= remaining) ? 0 : (remaining - spent);
+		if (__sync_val_compare_and_swap(&tier_warp_remaining_ns[tier],
+						 remaining, new_remaining)
+		    == remaining)
+			goto charged;
+		/* Lost the race to another CPU charging concurrently;
+		 * retry against whatever value it left behind. */
+	}
+	/*
+	 * Exhausted retries under heavy contention: be conservative and
+	 * decline to warp this time rather than risk a stale charge.  The
+	 * tier simply falls through to normal EDF for this dispatch call
+	 * and gets another chance next time.
+	 */
+	return false;
+
+charged:
+	WRITE_ONCE(tier_warp_window_opened_ns[tier], now);
+	if (new_remaining == 0) {
+		WRITE_ONCE(tier_warp_window_until_ns[tier], 0);
+		return false;
+	}
+	return true;
 }
 
-static inline void warp_arm_local(u64 enqueue_ts)
+/*
+ * tier_warp_refill(): called when `tier` wins the EDF race fairly (on
+ * deadline alone, not via warp).  Restores its warp budget to full and
+ * closes any open window, exactly like XNU restoring scrb_warp_remaining
+ * when a bucket is chosen in natural order.
+ *
+ * A plain store is correct here (no CAS needed): refilling always sets
+ * the budget to the same fixed full value regardless of what was there
+ * before, so two concurrent refills converge to the same result either
+ * way: full budget. Concurrent perfectly-interleaved consume + refill is
+ * the case worth naming: in the worst case a refill is overwritten by a
+ * stale, smaller consume result, undercharging that one window by at
+ * most a few microseconds, of a budget measured in milliseconds, which is
+ * within scheduler noise and does not violate the warp/EDF starvation
+ * bound this mechanism exists to guarantee. The CAS loop above is the
+ * lock specifically against the case that does matter: lost deductions.
+ */
+static inline void tier_warp_refill(u8 tier)
 {
-	u64 deadline = enqueue_ts + WARP_WINDOW_NS;
-	struct cpu_ctx *cctx;
-	s32 this_cpu = bpf_get_smp_processor_id();
-
-	cctx = try_lookup_cpu_ctx(this_cpu);
-	if (!cctx) return;
-	if (time_before(cctx->warp_deadline, deadline))
-		cctx->warp_deadline = deadline;
+	if (tier_warp_budget_ns[tier] == 0)
+		return;
+	WRITE_ONCE(tier_warp_remaining_ns[tier], tier_warp_budget_ns[tier]);
+	WRITE_ONCE(tier_warp_window_until_ns[tier], 0);
 }
 
 /* ─── Per-tier WCEL enforcement ─────────────────────────────────────────
  *
- * XNU analogue: sched_clutch_root_select_bucket() starvation avoidance.
+ * XNU analogue: sched_clutch_root_highest_root_bucket() starvation avoidance.
  *
  * For each tier we record when the current head was enqueued
  * (tier_enqueue_ts[]).  In dispatch(), before the EDF race, any tier
@@ -686,15 +906,90 @@ static inline void warp_arm_local(u64 enqueue_ts)
  * already achieved by tier_vtime_base = 0.
  * ─────────────────────────────────────────────────────────────────────── */
 
-static inline bool tier_wcel_expired(u8 tier, u64 now)
+/*
+ * tier_wcel_expired(): has `tier`'s head been waiting longer than its
+ * WCEL budget, and if so, is it still within a bounded starvation
+ * avoidance window (or does it not need one)?
+ *
+ * XNU analogue: the starvation-avoidance branch of
+ * sched_clutch_root_highest_root_bucket() (sched_clutch.c).  Real
+ * Clutch does NOT let an aged-out bucket win unconditionally for as
+ * long as its head stays old — it only does so when no higher bucket
+ * is currently runnable.  When a higher bucket *is* runnable, the aged
+ * bucket instead gets a single bounded quantum (scrb_starvation_ts +
+ * sched_clutch_thread_quantum[bucket]), after which its deadline is
+ * recomputed and the decision is re-evaluated from scratch — i.e. the
+ * lower bucket gets "roughly one quantum per core" rather than the
+ * whole CPU for as long as it likes.
+ *
+ * `higher_runnable` should be true iff a strictly higher tier than
+ * `tier` currently has a queued head task (e.g. p_iact for tier ==
+ * TIER_DEFAULT or TIER_BACKGROUND, or p_iact-or-p_def for tier ==
+ * TIER_BACKGROUND).  When false, this collapses to the original
+ * unconditional-override behavior, since there is nothing to bound
+ * against — XNU does exactly the same collapse for its top bucket.
+ */
+static inline bool tier_wcel_expired(u8 tier, u64 now, bool higher_runnable)
 {
 	u64 wcel = tier_wcel_ns[tier];
-	u64 enq_ts;
+	u64 enq_ts, quantum, win_start;
 
 	if (wcel == 0) return false;	/* TIER_INTERACTIVE: no bound */
 	enq_ts = READ_ONCE(tier_enqueue_ts[tier]);
 	if (enq_ts == 0) return false;	/* tier is empty             */
-	return (now - enq_ts) >= wcel;
+	if ((now - enq_ts) < wcel) {
+		/* Not aged out yet: make sure any stale window from a
+		 * previous episode is closed so it can't linger. */
+		if (READ_ONCE(tier_starvation_active[tier]))
+			WRITE_ONCE(tier_starvation_active[tier], false);
+		return false;
+	}
+
+	if (!higher_runnable) {
+		/*
+		 * Nothing above this tier is runnable right now: nothing to
+		 * bound against, so this matches XNU's "EDF bucket selected
+		 * in the natural order" branch — force the win, no window
+		 * needed.  Make sure we're not left mid-window from an
+		 * episode where something higher was runnable a moment ago.
+		 */
+		WRITE_ONCE(tier_starvation_active[tier], false);
+		return true;
+	}
+
+	quantum = (tier == TIER_BACKGROUND) ? STARVATION_QUANTUM_BACKGROUND_NS
+					     : STARVATION_QUANTUM_DEFAULT_NS;
+
+	if (!READ_ONCE(tier_starvation_active[tier])) {
+		/* Opening a fresh window: this is the moment a higher tier
+		 * is runnable but this tier's aged head still needs to win
+		 * right now, matching XNU's
+		 * "edf_bucket->scrb_starvation_avoidance = true" branch. */
+		WRITE_ONCE(tier_starvation_active[tier], true);
+		WRITE_ONCE(tier_starvation_ts[tier], now);
+		__sync_fetch_and_add(&nr_starvation_window_opens, 1);
+		return true;
+	}
+
+	win_start = READ_ONCE(tier_starvation_ts[tier]);
+	if ((now - win_start) >= quantum) {
+		/*
+		 * Window has run its full quantum: close it.  Returning
+		 * false here is the key difference from the old unbounded
+		 * behavior — the tier stops being forced to win and falls
+		 * through to a normal EDF comparison against the higher
+		 * tier for this dispatch call, exactly as XNU recomputes
+		 * the bucket's deadline and re-evaluates from
+		 * evaluate_root_buckets rather than re-granting starvation
+		 * avoidance immediately.  If the tier is still starved next
+		 * time around, a fresh window opens again above.
+		 */
+		WRITE_ONCE(tier_starvation_active[tier], false);
+		return false;
+	}
+
+	/* Still inside an already-open window: keep forcing the win. */
+	return true;
 }
 
 /*
@@ -1335,8 +1630,14 @@ void BPF_STRUCT_OPS(aura_enqueue, struct task_struct *p, u64 enq_flags)
 		if (warp_enabled) {
 			s32 kick_cpu;
 
-			warp_arm_local(enqueue_ts);
-
+			/*
+			 * Wake CPUs so dispatch() runs promptly and can
+			 * decide, against the shared per-tier warp budget,
+			 * whether TIER_INTERACTIVE gets to jump ahead of
+			 * EDF right now.  Arming/spending the budget itself
+			 * happens only in dispatch() — see
+			 * tier_warp_try_consume().
+			 */
 			bpf_for(kick_cpu, 0, MIN(nr_cpu_ids, MAX_CPUS)) {
 				if (scx_bpf_test_and_clear_cpu_idle(kick_cpu)) {
 					scx_bpf_kick_cpu(kick_cpu, SCX_KICK_IDLE);
@@ -1408,12 +1709,50 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 	p_def  = __COMPAT_scx_bpf_dsq_peek(tier_dsq(TIER_DEFAULT));
 	p_bg   = __COMPAT_scx_bpf_dsq_peek(tier_dsq(TIER_BACKGROUND));
 
-	/* ── Warp: drain interactive tier ahead of EDF. ─────────────────── */
-	if (p_iact && cctx) {
-		if (!warp_is_active(cctx, now) && warp_enabled)
-			cctx->warp_deadline = now + WARP_WINDOW_NS;
+	/*
+	 * WCEL expiry is computed up front because both warp blocks below
+	 * need to know it: there is no point spending a tier's warp budget
+	 * to jump ahead of a lower tier that WCEL is about to force to win
+	 * unconditionally anyway (see MAYBE_WIN_WCEL further down).
+	 *
+	 * higher_runnable for each tier is whether a strictly higher tier
+	 * currently has a queued head task — this is what lets
+	 * tier_wcel_expired() distinguish "nothing above me, force the win
+	 * outright" from "something above me is runnable too, bound this
+	 * to one starvation-avoidance quantum" (see that function's
+	 * comment, and sched_clutch_root_highest_root_bucket() in real
+	 * XNU for the mechanism this mirrors).
+	 */
+	wcel_def = tier_wcel_expired(TIER_DEFAULT, now, p_iact != NULL);
+	wcel_bg  = tier_wcel_expired(TIER_BACKGROUND, now,
+				      (p_iact != NULL) || (p_def != NULL));
 
-		if (warp_is_active(cctx, now)) {
+	/*
+	 * ── Warp: drain interactive tier ahead of EDF. ───────────────────
+	 *
+	 * Gated on !is_deadline_min(p_cpu, p_iact): warp may only let
+	 * TIER_INTERACTIVE jump ahead of the *other tier DSQs*, never ahead
+	 * of a task already sitting in this CPU's own per-CPU DSQ
+	 * (cpu_dsq(cpu)) with a strictly earlier deadline.  cpu_dsq(cpu) is
+	 * a direct-placement fast path (idle-CPU picks, sticky/pcpu tasks,
+	 * migration targets — see aura_enqueue()), not a tier in the
+	 * XNU-bucket sense, so warp has no business overriding a placement
+	 * decision already locked in for this CPU.  Without this check, a
+	 * task placed directly on cpu_dsq(cpu) with an earlier deadline
+	 * than anything queued could still lose its dispatch slot to a
+	 * tier's warp shortcut, which is a correctness bug independent of
+	 * anything XNU-fidelity related.
+	 */
+	if (p_iact && cctx && (p_def || p_bg) &&
+	    !is_deadline_min(p_cpu, p_iact)) {
+		/*
+		 * Only spend warp budget when there is actually something
+		 * for TIER_INTERACTIVE to jump ahead of.  If DEFAULT and
+		 * BACKGROUND are both empty, normal EDF already dispatches
+		 * the interactive task next anyway, so consuming budget
+		 * here would just waste it for no behavioral gain.
+		 */
+		if (tier_warp_try_consume(TIER_INTERACTIVE, now)) {
 			if (scx_bpf_dsq_move_to_local(
 					tier_dsq(TIER_INTERACTIVE), 0)) {
 				if (scx_bpf_dsq_nr_queued(
@@ -1428,9 +1767,68 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
+	 * ── Warp: drain default tier ahead of EDF, over background only.
+	 *
+	 * Mirrors the interactive warp block above but for DEFAULT's
+	 * smaller budget (2 ms vs INTERACTIVE's 8 ms), and only relative
+	 * to BACKGROUND — DEFAULT never warps over INTERACTIVE, since
+	 * INTERACTIVE's own WCEL of 0 plus its much larger budget already
+	 * guarantee it wins whenever it has anything queued.
+	 *
+	 * That "INTERACTIVE always wins anyway" reasoning only holds if
+	 * this block actually checks p_iact — it must not assume the
+	 * interactive warp block above already handled it.  That block
+	 * only returns early when it actually *fires*; if it declines (no
+	 * warp budget left, or its own !is_deadline_min(p_cpu, p_iact)
+	 * gate blocks it) control falls through to here with p_iact still
+	 * sitting unconsidered.  Without an explicit check here, DEFAULT's
+	 * warp could steal the dispatch slot out from under a genuinely
+	 * earlier-deadline interactive task — undermining exactly the
+	 * "interactive always runs as soon as a CPU is free" guarantee
+	 * this scheduler exists to provide.  Same reasoning applies to
+	 * p_cpu (a directly-placed task on this CPU's own per-CPU DSQ):
+	 * neither is a competitor DEFAULT's warp is entitled to jump.
+	 *
+	 * Also skipped when wcel_bg is already true: if BACKGROUND's WCEL
+	 * is about to force it to win unconditionally regardless of warp,
+	 * spending DEFAULT's budget here accomplishes nothing (the
+	 * MAYBE_WIN_WCEL race below would just override the result) and
+	 * would needlessly burn the budget tier_warp_refill(TIER_DEFAULT)
+	 * would otherwise preserve.
+	 *
+	 * Note there is no separate "!wcel_def" check needed here: if
+	 * wcel_def is true, DEFAULT is being forced to win against
+	 * INTERACTIVE via MAYBE_WIN_WCEL's *local* synthetic deadline,
+	 * which never mutates p_def's real dsq_vtime — so
+	 * is_deadline_min(p_iact, p_def) above still compares genuine
+	 * vtimes and is true (blocking this block) precisely when
+	 * INTERACTIVE's real deadline is earlier, which is exactly the
+	 * condition that made wcel_def true to begin with.  The p_iact
+	 * gate already covers this case as a consequence, not by
+	 * coincidence.
+	 */
+	if (p_def && p_bg && cctx && !wcel_bg &&
+	    !is_deadline_min(p_cpu, p_def) &&
+	    !is_deadline_min(p_iact, p_def)) {
+		if (tier_warp_try_consume(TIER_DEFAULT, now)) {
+			if (scx_bpf_dsq_move_to_local(
+					tier_dsq(TIER_DEFAULT), 0)) {
+				if (scx_bpf_dsq_nr_queued(
+						tier_dsq(TIER_DEFAULT)) == 0)
+					tier_enqueue_ts_clear(TIER_DEFAULT);
+				__sync_fetch_and_add(
+					&nr_default_warp_dispatches, 1);
+				__sync_fetch_and_add(
+					&nr_dispatch_cpu_dsq_consumes, 1);
+				return;
+			}
+		}
+	}
+
+	/*
 	 * ── WCEL enforcement ────────────────────────────────────────────
 	 *
-	 * XNU analogue: sched_clutch_root_select_bucket() starvation window.
+	 * XNU analogue: sched_clutch_root_highest_root_bucket() starvation window.
 	 *
 	 * If a lower tier has been waiting longer than its WCEL budget,
 	 * override its head task's dsq_vtime to 0 so it wins the EDF race
@@ -1438,11 +1836,9 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 	 *
 	 * TIER_INTERACTIVE has WCEL = 0 (must always win immediately) which
 	 * is already guaranteed by tier_vtime_base[0] = 0.  Only DEFAULT and
-	 * BACKGROUND need the explicit check.
+	 * BACKGROUND need the explicit check.  wcel_def/wcel_bg were already
+	 * computed above so the warp blocks could consult them.
 	 */
-	wcel_def  = tier_wcel_expired(TIER_DEFAULT, now);
-	wcel_bg   = tier_wcel_expired(TIER_BACKGROUND, now);
-
 	if ((wcel_def && p_def) || (wcel_bg && p_bg)) {
 		__sync_fetch_and_add(&nr_wcel_enforcements, 1);
 		dbg_msg("WCEL: def=%d bg=%d at cpu %d", wcel_def, wcel_bg, cpu);
@@ -1504,12 +1900,32 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 				if (scx_bpf_dsq_nr_queued(
 						tier_dsq(TIER_INTERACTIVE)) == 0)
 					tier_enqueue_ts_clear(TIER_INTERACTIVE);
+				/*
+				 * Reaching here means TIER_INTERACTIVE won
+				 * the EDF race on deadline alone (the warp
+				 * shortcut above already returned if it had
+				 * fired) — a fair win, so restore its warp
+				 * budget to full.
+				 */
+				tier_warp_refill(TIER_INTERACTIVE);
 				__sync_fetch_and_add(
 					&nr_interactive_dispatches, 1);
 			} else if (win_dsq == tier_dsq(TIER_DEFAULT)) {
 				if (scx_bpf_dsq_nr_queued(
 						tier_dsq(TIER_DEFAULT)) == 0)
 					tier_enqueue_ts_clear(TIER_DEFAULT);
+				/*
+				 * Refill only on a genuine fair win (deadline
+				 * comparison).  If wcel_def is true, DEFAULT
+				 * won via the WCEL starvation override
+				 * instead (MAYBE_WIN_WCEL's synthetic zero
+				 * deadline) — that is not a "natural order"
+				 * win, so it must not refill warp, exactly
+				 * as XNU does not refill scrb_warp_remaining
+				 * on a starvation-forced selection either.
+				 */
+				if (!wcel_def)
+					tier_warp_refill(TIER_DEFAULT);
 			} else if (win_dsq == tier_dsq(TIER_BACKGROUND)) {
 				if (scx_bpf_dsq_nr_queued(
 						tier_dsq(TIER_BACKGROUND)) == 0)
@@ -1517,6 +1933,45 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 			}
 			__sync_fetch_and_add(&nr_dispatch_cpu_dsq_consumes, 1);
 			return;
+		}
+	}
+
+	/*
+	 * ── Passive E-core → P-core rebalance ───────────────────────────
+	 *
+	 * XNU analogue: sched_amp_balance() — once a P-core goes idle, pull
+	 * back P-recommended work that had spilled onto E-cores.
+	 *
+	 * This is the "passive" half of that idea: we never kick or IPI an
+	 * E-core, and we never touch a task that is already *running*
+	 * there.  We only act when this P-core is otherwise about to go
+	 * idle (every other dispatch source above came up empty) and
+	 * consolidation is currently desired — i.e. exactly the scenario
+	 * should_consolidate() already steers new placements away from
+	 * E-cores for.  Without this, a task that landed on an E-core
+	 * during a busier moment can sit there until it happens to wake
+	 * up again, even while a P-core sits idle right next to it.
+	 *
+	 * We only ever pull *queued* (not-yet-running) tasks out of an
+	 * E-core's per-CPU DSQ via the normal DSQ move primitive, so this
+	 * carries no extra synchronization risk beyond what dispatch()
+	 * already does for its own per-CPU DSQ.
+	 */
+	if (!is_cpu_efficient(cpu) && should_consolidate()) {
+		s32 ecpu, max_cpu = MIN(nr_cpu_ids, MAX_CPUS);
+
+		bpf_for(ecpu, 0, max_cpu) {
+			if (ecpu == cpu || !is_cpu_efficient(ecpu))
+				continue;
+			if (scx_bpf_dsq_nr_queued(cpu_dsq(ecpu)) == 0)
+				continue;
+			if (scx_bpf_dsq_move_to_local(cpu_dsq(ecpu), 0)) {
+				__sync_fetch_and_add(
+					&nr_ecore_rebalance_pulls, 1);
+				__sync_fetch_and_add(
+					&nr_dispatch_cpu_dsq_consumes, 1);
+				return;
+			}
 		}
 	}
 
@@ -1808,6 +2263,34 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(aura_init)
 	tier_enqueue_ts[TIER_INTERACTIVE] = 0;
 	tier_enqueue_ts[TIER_DEFAULT]     = 0;
 	tier_enqueue_ts[TIER_BACKGROUND]  = 0;
+
+	/*
+	 * Per-tier warp budgets and accounting.  Each tier starts with a
+	 * full budget (as if it had just won fairly), mirroring XNU's
+	 * initial state where every root bucket starts un-warped with its
+	 * full allowance available.
+	 */
+	tier_warp_budget_ns[TIER_INTERACTIVE] = WARP_BUDGET_INTERACTIVE_NS;
+	tier_warp_budget_ns[TIER_DEFAULT]     = WARP_BUDGET_DEFAULT_NS;
+	tier_warp_budget_ns[TIER_BACKGROUND]  = WARP_BUDGET_BACKGROUND_NS;
+
+	tier_warp_remaining_ns[TIER_INTERACTIVE]    = WARP_BUDGET_INTERACTIVE_NS;
+	tier_warp_remaining_ns[TIER_DEFAULT]        = WARP_BUDGET_DEFAULT_NS;
+	tier_warp_remaining_ns[TIER_BACKGROUND]     = WARP_BUDGET_BACKGROUND_NS;
+	tier_warp_window_until_ns[TIER_INTERACTIVE] = 0;
+	tier_warp_window_until_ns[TIER_DEFAULT]     = 0;
+	tier_warp_window_until_ns[TIER_BACKGROUND]  = 0;
+	tier_warp_window_opened_ns[TIER_INTERACTIVE] = 0;
+	tier_warp_window_opened_ns[TIER_DEFAULT]     = 0;
+	tier_warp_window_opened_ns[TIER_BACKGROUND]  = 0;
+
+	/* Starvation-avoidance windows start closed for every tier. */
+	tier_starvation_active[TIER_INTERACTIVE] = false;
+	tier_starvation_active[TIER_DEFAULT]     = false;
+	tier_starvation_active[TIER_BACKGROUND]  = false;
+	tier_starvation_ts[TIER_INTERACTIVE]     = 0;
+	tier_starvation_ts[TIER_DEFAULT]         = 0;
+	tier_starvation_ts[TIER_BACKGROUND]      = 0;
 
 	init_cpuperf_target();
 
