@@ -5,10 +5,10 @@
 > **ABSTRACT**: `scx_aura` is a BPF CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx), designed for **laptop workloads** that demand both low-latency responsiveness and long battery life. It classifies every task by observed sleep and CPU behaviour, routes work through a 3-tier priority system, and actively manages CPU placement and frequency to keep efficiency cores idle.
 >
 > - **3-Tier Classification** Tasks sorted into Interactive / Default / Background by per-process sleep-to-CPU ratio and per-task wakeup frequency
-> - **Starvation Enforcement** Each tier has a hard latency budget (0 ms / 75 ms / 250 ms); expired budgets win dispatch unconditionally regardless of normal ordering
-> - **Priority Dispatch Window** Interactive tasks arm an 8 ms priority window on arrival; during that window they preempt all lower-tier work without waiting for EDF ordering
+> - **Bounded Starvation Avoidance** Each tier has a hard latency budget (0 ms / 75 ms / 250 ms); an expired budget wins dispatch unconditionally only if nothing higher is runnable — otherwise it's granted a single bounded quantum before the decision is re-evaluated, so a lower tier can never monopolize the CPU once a higher tier is also waiting
+> - **Depleting Warp Budget** Each tier gets a per-tier budget (8 ms / 2 ms / 0 ms) to preempt EDF ordering ahead of lower tiers; the budget drains in real time while spent and only refills when the tier wins its next dispatch fairly, so sustained arrivals can never warp indefinitely
 > - **Adaptive Time-Slice Feedback** Per-task queue delay drives a fixed-point gain that scales each task's slice up or down; gradient detection and a high-activity-index streak catch rising and sustained congestion
-> - **E-Core Idle Consolidation** When the system is below 75% load, all tiers avoid efficiency cores, letting them reach deep C-states and extend battery life
+> - **E-Core Idle Consolidation with Passive Rebalance** When the system is below 75% load, all tiers avoid efficiency cores at enqueue time, and an idle performance core will reclaim work already sitting on an efficiency core's queue rather than let it sit there while the P-core idles
 > - **Per-Process Interactivity Scoring** Each process group accumulates CPU-used and voluntary-sleep time; the ratio updates a 0–16 score that drives tier placement and decays over time so past behaviour does not permanently define a group
 
 ## Navigation
@@ -16,7 +16,7 @@
 - [1. Quick Start](#1-quick-start)
 - [2. Philosophy](#2-philosophy)
 - [3. 3-Tier System](#3-3-tier-system)
-- [4. Priority Dispatch Window](#4-priority-dispatch-window)
+- [4. Warp Budget and Starvation Avoidance](#4-warp-budget-and-starvation-avoidance)
 - [5. Adaptive Time-Slice Feedback](#5-adaptive-time-slice-feedback)
 - [6. Power Management](#6-power-management)
 - [7. Architecture](#7-architecture)
@@ -101,31 +101,38 @@ The per-process score is recalculated every time the process's on-CPU time cross
 
 ---
 
-## 4. Priority Dispatch Window
+## 4. Warp Budget and Starvation Avoidance
 
-When a T0 task is enqueued into a tier DSQ (no idle CPU was available for direct dispatch), it arms an 8 ms per-CPU priority window. During that window, every dispatch call on every CPU drains the interactive DSQ first, bypassing normal EDF ordering.
+`scx_aura` lets a tier jump ahead of normal EDF ordering through two related but distinct mechanisms: a **depleting warp budget** (a tier spending its own allowance to preempt) and a **bounded starvation-avoidance window** (a tier being granted one quantum because it has aged past its latency budget). Both are modeled on the equivalent mechanisms in XNU's Clutch scheduler, and both are deliberately *bounded* — neither can let a tier monopolize the CPU indefinitely.
 
-| Property | Value |
-| :--- | :--- |
-| Window duration | 8 ms |
-| Scope | Per-CPU (each CPU tracks its own deadline) |
-| Trigger | Any T0 enqueue to the tier DSQ |
-| Effect | T0 tasks are consumed ahead of all other tiers regardless of virtual deadline |
-| Fallback | After 8 ms or if the interactive DSQ empties, normal EDF resumes |
+### Warp Budget
 
-When a T0 task is enqueued, every busy CPU is kicked with `SCX_KICK_PREEMPT` and every idle CPU is woken with `SCX_KICK_IDLE`. Each CPU that receives the kick arms its own priority window in the dispatch path when it sees pending interactive work, so the window propagates to the CPU that will actually run the task rather than being a global lock.
+Each tier holds a per-tier budget that lets it jump ahead of lower tiers in the EDF race. The budget is shared across CPUs (not per-CPU), drains in real time while a tier is actively using it, and is only refilled when the tier wins its next dispatch *fairly* — on deadline alone, without spending warp. A tier with continuous arrivals cannot warp forever: once its budget is exhausted, it falls back to normal EDF until it earns a fair win and refills.
 
-### Starvation Enforcement
+| Tier | Warp budget | Can warp over |
+| :--- | :--- | :--- |
+| Interactive | 8 ms | Default, Background |
+| Default | 2 ms | Background only |
+| Background | 0 ms | — (never warps) |
 
-Independent of the priority window, each tier has a hard latency budget enforced by tracking the wall-clock timestamp of when the oldest task entered each tier DSQ. If that age exceeds the tier's budget, the dispatch path substitutes a synthetic zero-deadline for that tier's head task during the EDF selection, making it win unconditionally.
+Warp is only attempted when there is actually something to jump ahead of — if the lower tiers are empty, normal EDF already dispatches the higher tier next, so no budget is spent. Warp also never overrides a task already placed directly on a CPU's own per-CPU dispatch queue (sticky tasks, kthreads, migration-pinned tasks) if that task's own deadline is earlier — those placements are never preempted by a tier's warp shortcut.
 
-| Tier | Budget |
+### Starvation Avoidance
+
+Independent of warp, each tier has a hard latency budget enforced by tracking the wall-clock timestamp of the oldest task in each tier's queue.
+
+| Tier | Latency budget |
 | :--- | :--- |
 | Interactive | 0 ms (always wins) |
 | Default | 75 ms |
 | Background | 250 ms |
 
-The starvation timestamp only clears when the tier DSQ becomes empty, so the budget correctly tracks the age of the queue's oldest waiting task, not just the most recently dispatched one.
+When a tier's head task ages past its budget, what happens next depends on whether anything *higher* is currently runnable:
+
+- **Nothing higher runnable:** the aged tier wins dispatch unconditionally — there is nothing to bound against, so this matches XNU's natural-order selection.
+- **A higher tier is also runnable:** the aged tier is instead granted a single **1 ms starvation-avoidance window**. It wins dispatch for the duration of that window, then the decision is re-evaluated from scratch. If the tier is still starved on the next pass, a fresh window opens. This gives the aged tier roughly one quantum each time it reaches the front of the queue, rather than letting it lock out higher tiers for as long as its head stays old.
+
+The starvation timestamp only clears when the tier's queue becomes empty, so the budget correctly tracks the age of the queue's oldest waiting task, not just the most recently dispatched one.
 
 ---
 
@@ -160,6 +167,12 @@ When `nr_running < 75% × nr_online_cpus` (lightly loaded), tasks of **all tiers
 
 The threshold is intentional — at 75% load the system is no longer lightly loaded and E-core avoidance stops, so there is no throughput cost under sustained workloads.
 
+### Passive Rebalance
+
+Consolidation only governs *new* placements — it does not by itself move work that already landed on an E-core before consolidation kicked in. To close that gap, when a performance core finds nothing of its own to dispatch while consolidation is active, it checks every efficiency core's per-CPU dispatch queue and claims any task waiting there before going idle.
+
+This is deliberately passive: it never sends an IPI or kick to the efficiency core, and it never touches a task that is already running — it only reclaims queued (not yet running) work, using the same dispatch-queue move primitive the scheduler already uses for its own per-CPU queue. The effect is that a P-core finishing its own work absorbs spillover from an E-core instead of letting that E-core stay powered to finish it, while the P-core would otherwise have gone idle regardless.
+
 ### CPU Frequency Scaling
 
 The scheduler drives per-CPU frequency via `scx_bpf_cpuperf_set` based on measured utilisation:
@@ -184,8 +197,8 @@ By default, a 1000 µs PM QoS latency constraint is applied to every CPU. This p
 
 ```
 select_cpu → sample enqueue_ts, classify tier, pick idle CPU, direct-dispatch if idle
-enqueue    → sample enqueue_ts, tier DSQ insert, arm priority window if T0, kick CPUs
-dispatch   → warp window check → starvation check → EDF across all DSQs → keep_running
+enqueue    → sample enqueue_ts, tier DSQ insert, kick CPUs so dispatch runs promptly for T0
+dispatch   → warp budget check → starvation check → EDF across all DSQs → E-core rebalance pull → keep_running
 running    → sample delay, update TIMELY gain, advance vtime_now from raw vtime
 stopping   → advance vruntime, update cpufreq utilisation, update group score
 runnable   → update wakeup_freq EWMA, accumulate group blocked time
@@ -197,8 +210,10 @@ exit_task  → delete group score map entry when last thread exits
 | Structure | Purpose |
 | :--- | :--- |
 | `task_ctx` | Per-task: vruntime, wakeup\_freq, avg\_runtime, tier, TIMELY gain/delay/gradient/HAI |
-| `cpu_ctx` | Per-CPU: runtime accumulators, frequency tracking, per-CPU warp deadline |
+| `cpu_ctx` | Per-CPU: runtime accumulators, frequency tracking, SMT sibling mask |
 | `group_iact` | Per-tgid: cpu\_used\_ns, blocked\_accum\_ns, score, tier, decay generation counter |
+
+Warp budgets and starvation-avoidance window state are tracked globally per tier (shared across CPUs), not per-CPU — both mechanisms refill or reset based on which tier wins dispatch, not on which CPU happens to be running it.
 
 ### DSQ Layout
 
@@ -226,8 +241,8 @@ Running `scx_aura` with no arguments loads a laptop-optimised preset. Every valu
 | Idle resume latency | 1000 µs | Disabled | Permits C6, blocks C10 |
 | Preferred idle scan | On | Off | Capacity-sorted idle selection for deterministic P-core preference |
 | Group interactivity | On | — | Per-process scoring active |
-| Priority dispatch window | On | — | 8 ms T0 priority window active |
-| E-core consolidation | On | — | Active below 75% system load |
+| Warp budget | On | — | Per-tier depleting preemption budget active (`--no-warp` to disable) |
+| E-core consolidation + rebalance | On | — | Active below 75% system load; idle P-cores reclaim E-core spillover |
 | Adaptive slices (TIMELY) | Off | Off | Opt-in with `--timely` |
 
 ---
@@ -249,7 +264,7 @@ Running `scx_aura` with no arguments loads a laptop-optimised preset. Every valu
 --no-preferred-idle-scan    Disable capacity-sorted idle CPU selection
 --no-cpufreq                Disable scheduler-driven frequency scaling
 --no-group-iact             Disable per-process interactivity scoring
---no-warp                   Disable the interactive priority dispatch window
+--no-warp                   Disable per-tier warp budget (EDF-only ordering, no preemption)
 --no-ecore-consolidate      Disable E-core idle consolidation
 --disable-smt               Disable SMT awareness
 --disable-numa              Disable NUMA awareness
@@ -261,18 +276,18 @@ Running `scx_aura` with no arguments loads a laptop-optimised preset. Every valu
 
 ## 10. Overhead
 
-The overhead relative to a minimal sched_ext skeleton is concentrated in `enqueue` and `select_cpu`. The `dispatch` path — the tightest loop under sustained load — has no structural change from upstream `scx_bpfland`.
+The overhead relative to a minimal sched_ext skeleton is concentrated in `enqueue`, `select_cpu`, and `dispatch`. Unlike earlier revisions, `dispatch` is no longer a thin wrapper around upstream `scx_bpfland`'s loop — the warp-budget accounting, the bounded starvation window, and the E-core rebalance pull all run there. Compiled with `clang -O2 -target bpf`, `dispatch` is the largest callback in the scheduler at roughly 1000 BPF instructions, still well within normal range for this class of program and with no observed verifier-complexity warnings under `-Wall -Wextra`.
 
 | Function | Added cost | Notes |
 | :--- | :--- | :--- |
 | `select_cpu` | +1 ktime call | `enqueue_ts` sampled once; reused for TIMELY and warp |
 | `enqueue` | +2–4 DSQ nr\_queued calls | For starvation enforcement; zero when tier DSQs are empty |
-| `dispatch` | +4 DSQ peek calls | One per tier head task; WCEL check is 2 comparisons |
+| `dispatch` | +4 DSQ peek calls, up to 2 deadline-min comparisons per warp attempt, a bounded CAS retry (≤16 iterations) when warp budget is actually spent, and — only when a P-core is otherwise about to idle during consolidation — a bounded scan of efficiency-core queues | Warp and starvation checks are skipped entirely when the relevant tier DSQs are empty; the rebalance scan only runs on the idle-fallback path, not on every dispatch call |
 | `running` | +1 TIMELY sample | Only when `timely_enabled`; no-op otherwise |
 | `stopping` | +1 map lookup | Group interactivity score update (hash map, ~5 ns) |
 | `exit_task` | +1 map delete | Only on last thread exit of a process |
 
-All per-task TIMELY state shares the `task_ctx` allocation with the core scheduling fields. No additional per-task allocations are introduced.
+All per-task TIMELY state shares the `task_ctx` allocation with the core scheduling fields. No additional per-task allocations are introduced. Warp and starvation-avoidance state are small fixed-size global arrays (one entry per tier), not per-task or per-CPU allocations.
 
 ---
 
@@ -285,8 +300,9 @@ All per-task TIMELY state shares the `task_ctx` allocation with the core schedul
 | **Tier** | Priority level (T0–T2). Controls dispatch order, starvation budget, and vtime offset. |
 | **Vtime** | Virtual runtime used as DSQ sort key. Includes tier offset so cross-tier comparison needs no branching. |
 | **Lag** | Credit given to sleeping tasks: the more a task sleeps, the earlier its vtime deadline relative to CPU-bound peers. |
-| **Starvation budget** | Maximum wall-clock time a tier's head task can wait before winning dispatch unconditionally. |
-| **Priority window** | The 8 ms window during which T0 tasks preempt all EDF ordering. Tracked per-CPU. |
+| **Starvation budget** | Maximum wall-clock time a tier's head task can wait before triggering starvation avoidance — unconditional if nothing higher is runnable, otherwise a bounded window. |
+| **Warp budget** | Per-tier allowance (shared across CPUs) that lets a tier jump ahead of lower tiers in EDF. Drains while spent; refills only on a fair (non-warp, non-starvation-override) win. |
+| **Starvation-avoidance window** | The single bounded quantum (1 ms) a tier is granted when its latency budget expires while a higher tier is also runnable. Re-opens if the tier is still starved afterward; tracked per tier, not per-CPU. |
 | **Interactivity score** | Per-process 0–16 value derived from `blocked / (blocked + cpu_used)`. High score → interactive. |
 | **Decay generation** | Integer counter tracking how many 500 ms windows have elapsed; used to gate score decay to once per window. |
 | **Gain** | Fixed-point TIMELY multiplier in [128..1024] applied to `slice_max` to produce the per-task slice. |
@@ -313,7 +329,8 @@ All per-task TIMELY state shares the `task_ctx` allocation with the core schedul
 | Vruntime EDF with lag-based interactivity | scx\_bpfland |
 | Three-tier classification with per-process scoring | XNU Clutch scheduler concepts (Apple open-source) |
 | Delay-driven adaptive slice feedback | TIMELY research (SIGCOMM 2015 — Swift congestion control adapted for CPU scheduling) |
-| Priority dispatch window | XNU root-bucket warp mechanism |
-| Starvation enforcement budgets | XNU WCEL (Worst-Case Execution Latency) per-bucket guarantees |
+| Depleting per-tier warp budget | XNU root-bucket warp mechanism (`scrb_warp_remaining`), including its fairness-gated refill |
+| Bounded starvation-avoidance window | XNU WCEL (Worst-Case Execution Latency) per-bucket guarantees, including the one-quantum starvation-avoidance window in `sched_clutch_root_highest_root_bucket()` |
 | E-core idle consolidation | XNU AMP spill/consolidation (inverted for power saving) |
+| Passive E-core → P-core rebalance | XNU `sched_amp_balance()` |
 | Per-CPU SMT-aware idle selection | scx\_bpfland preferred idle scan |
