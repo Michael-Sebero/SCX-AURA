@@ -56,6 +56,29 @@
  *  14 idle/dispatch stats counters fully wired at their call sites.
  *
  *  dbg_msg used at meaningful decision points throughout.
+ *
+ *  Battery/sleep audit pass (see inline "Audit fix (battery/sleep pass)"
+ *  comments at each call site for full detail):
+ *    - aura_enqueue() kicked *every* CPU in the system, idle and busy alike,
+ *      on every single TIER_INTERACTIVE enqueue. On a lightly-loaded laptop
+ *      this meant every keystroke/mouse-move/timer-tick woke every idle
+ *      core out of its C-state and IPI-preempted every busy one, for a
+ *      task only one CPU could ever run. Now kicks at most one CPU.
+ *    - aura_stopping()'s cpufreq utilisation sample accidentally measured
+ *      wall-clock time since the last accounting event (including idle
+ *      gaps) instead of actual task runtime, so it read ~100% "load" on
+ *      almost every call — scx_bpf_cpuperf_set() was requesting max
+ *      performance nearly continuously whenever cpufreq_perf_lvl < 0 (the
+ *      default), regardless of real load. Fixed to accumulate genuine
+ *      per-task runtime, paired with a sampling-window reset in
+ *      update_cpu_load() so a CPU waking from a long idle stretch isn't
+ *      judged against how long it was asleep (which would otherwise trade
+ *      the bug for under-clocking right when responsiveness matters most).
+ *    - CPU idle-resume-latency QoS (userspace, main.rs) was requested for
+ *      every CPU in the system; now scoped to the primary domain only, so
+ *      E-cores/non-primary CPUs that consolidation is deliberately parking
+ *      can reach their deepest available C-state instead of being capped
+ *      at the same shallow limit as the interactive P-cores.
  */
 #include <scx/common.bpf.h>
 #include <scx/percpu.bpf.h>
@@ -66,6 +89,14 @@
 #define STARVATION_MS		5000ULL
 #define MAX_CPUS		1024
 #define MAX_WAKEUP_FREQ		64ULL
+
+/*
+ * Cap on the cpufreq utilisation sampling window (see update_cpu_load()).
+ * If a CPU has been idle longer than this since its last sample, the old
+ * window is discarded instead of being averaged in, so a long idle gap
+ * doesn't drag a freshly-started burst's utilisation reading toward zero.
+ */
+#define CPU_LOAD_WINDOW_CAP_NS	(32ULL * NSEC_PER_MSEC)
 
 /* Fixed-point scale for TIMELY gain. */
 #define FP_ONE			1024U
@@ -1441,9 +1472,25 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 
 	if (!cctx) return;
 
-	if (cctx->last_running == 0) {
+	/*
+	 * Cold start, or this CPU has been idle long enough that the old
+	 * window would dilute a freshly-started burst toward an artificially
+	 * low utilisation reading (audit fix, pairs with the tot_runtime fix
+	 * above: a CPU idle for, say, 500 ms and then running a 200 us burst
+	 * would otherwise compute ~0.04% "load" and request the minimum
+	 * performance level right as something new starts running on it —
+	 * the opposite of what we want the moment a long-idle CPU wakes up
+	 * to do real work).  Reset the window and request full performance
+	 * for this one sample; the next sample a slice later has real data
+	 * to react to, so this only costs one cpuperf request, not a
+	 * sustained high-frequency period.
+	 */
+	if (cctx->last_running == 0 ||
+	    now - cctx->last_running > CPU_LOAD_WINDOW_CAP_NS) {
 		cctx->last_running = now;
 		cctx->prev_runtime = cctx->tot_runtime;
+		if (cpufreq_perf_lvl < 0)
+			scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 		return;
 	}
 
@@ -1629,24 +1676,59 @@ void BPF_STRUCT_OPS(aura_enqueue, struct task_struct *p, u64 enq_flags)
 	if (tier == TIER_INTERACTIVE) {
 		if (warp_enabled) {
 			s32 kick_cpu;
+			bool kicked = false;
 
 			/*
-			 * Wake CPUs so dispatch() runs promptly and can
-			 * decide, against the shared per-tier warp budget,
-			 * whether TIER_INTERACTIVE gets to jump ahead of
-			 * EDF right now.  Arming/spending the budget itself
-			 * happens only in dispatch() — see
+			 * Wake at most one CPU so dispatch() runs promptly
+			 * and can decide, against the shared per-tier warp
+			 * budget, whether TIER_INTERACTIVE gets to jump ahead
+			 * of EDF right now.  Arming/spending the budget
+			 * itself happens only in dispatch() — see
 			 * tier_warp_try_consume().
+			 *
+			 * Audit fix (battery/sleep pass): this used to kick
+			 * *every* CPU on *every* interactive enqueue —
+			 * SCX_KICK_IDLE on whichever were idle, SCX_KICK_PREEMPT
+			 * on whichever were busy. Only one CPU can ever
+			 * dequeue this one task, so every other kick was pure
+			 * waste: on a lightly-loaded laptop it pulled every
+			 * idle core out of its C-state on every keystroke,
+			 * mouse move, or timer tick that produced an
+			 * interactive-tier task — directly defeating E-core
+			 * consolidation and package-level idle for any
+			 * session with steady light interactive use, which is
+			 * most laptop usage. It also IPI-preempted every busy
+			 * CPU in the system for a task only one of them could
+			 * ever actually run.
+			 *
+			 * Now: scan for a single idle CPU in capacity order
+			 * (preferred_cpus[] is always populated, so a P-core
+			 * is offered before an E-core when both are idle) and
+			 * kick only that one — a parked CPU is the one case
+			 * that genuinely needs a kick, since it will not
+			 * otherwise notice this task. If none are idle, every
+			 * CPU is already busy; fall back to a single
+			 * preempt-kick on prev_cpu rather than the whole
+			 * machine. That still bounds worst-case pickup
+			 * latency to one kick regardless of load, while every
+			 * other busy CPU reaches this task on its own via
+			 * WCEL(0)/EDF within one slice (well under 1 ms by
+			 * default) with no IPI needed at all.
 			 */
 			bpf_for(kick_cpu, 0, MIN(nr_cpu_ids, MAX_CPUS)) {
-				if (scx_bpf_test_and_clear_cpu_idle(kick_cpu)) {
-					scx_bpf_kick_cpu(kick_cpu, SCX_KICK_IDLE);
-				} else {
-					scx_bpf_kick_cpu(kick_cpu,
-							 SCX_KICK_PREEMPT);
-					__sync_fetch_and_add(
-						&nr_preempt_kicks, 1);
+				s32 cand = (s32)preferred_cpus[kick_cpu];
+				if (scx_bpf_test_and_clear_cpu_idle(cand)) {
+					scx_bpf_kick_cpu(cand, SCX_KICK_IDLE);
+					kicked = true;
+					goto interactive_kick_done;
 				}
+			}
+interactive_kick_done:
+			if (kicked) {
+				__sync_fetch_and_add(&nr_idle_select_path_picks, 1);
+			} else {
+				scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
+				__sync_fetch_and_add(&nr_preempt_kicks, 1);
 			}
 		}
 		__sync_fetch_and_add(&nr_interactive_dispatches, 1);
@@ -2031,7 +2113,7 @@ void BPF_STRUCT_OPS(aura_stopping, struct task_struct *p, bool runnable)
 {
 	u64 now = bpf_ktime_get_ns();
 	s32 cpu = scx_bpf_task_cpu(p);
-	u64 slice, delta_vtime, delta_runtime;
+	u64 slice, delta_vtime;
 	u8  tier;
 	struct task_ctx *tctx;
 	struct cpu_ctx  *cctx;
@@ -2054,8 +2136,30 @@ void BPF_STRUCT_OPS(aura_stopping, struct task_struct *p, bool runnable)
 
 	cctx = try_lookup_cpu_ctx(cpu);
 	if (!cctx) return;
-	delta_runtime      = now - cctx->last_running;
-	cctx->tot_runtime += delta_runtime;
+	/*
+	 * Audit fix (battery/sleep pass): this used to add
+	 * (now - cctx->last_running) to tot_runtime.  cctx->last_running is a
+	 * per-CPU "last accounting timestamp" maintained by update_cpu_load()
+	 * below, not a per-task start time — so that expression measured
+	 * wall-clock time since the *previous* task's accounting, including
+	 * any idle gap in between, and counted all of it as "runtime".  Since
+	 * update_cpu_load()'s own delta_t is computed from that same
+	 * cctx->last_running a few instructions later (before it has been
+	 * updated), the two came out numerically equal on almost every call,
+	 * so the utilisation ratio it computes (delta_runtime / delta_t) read
+	 * ~100% regardless of actual load.  In practice this meant
+	 * scx_bpf_cpuperf_set() requested max performance on nearly every
+	 * dispatch whenever cpufreq_perf_lvl < 0 (the default dynamic mode)
+	 * — the opposite of what "cpufreq" in the laptop preset is supposed
+	 * to do, and a direct, continuous drain on battery life.
+	 *
+	 * `slice` (computed above from tctx->last_run_at, the timestamp
+	 * *this task* actually started running) is the correct per-task
+	 * runtime contribution and is already used for vtime/avg_runtime
+	 * accounting above — reuse it here too so tot_runtime only ever
+	 * accumulates genuine busy time.
+	 */
+	cctx->tot_runtime += slice;
 
 	/*
 	 * Update frequency unconditionally.  When TIMELY is on, both the

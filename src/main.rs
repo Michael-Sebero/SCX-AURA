@@ -482,6 +482,28 @@ impl<'a> Scheduler<'a> {
             })?;
 
         // Apply idle resume latency QoS.
+        //
+        // Audit fix (battery/sleep pass): this used to loop over
+        // topo.all_cpus.values() unconditionally, applying the same tight
+        // latency constraint to every CPU in the system. That directly
+        // fights the E-core consolidation logic elsewhere in this
+        // scheduler, whose entire point is to let non-primary cores sit
+        // idle for as long as possible: capping their allowed resume
+        // latency at the same ~1 ms as the interactive P-cores means they
+        // can never enter a deeper C-state than C6 even while
+        // consolidation is actively parking them, and (on platforms where
+        // package-level idle requires every core to be deep enough) can
+        // block PC10/full-package idle even when the whole system is
+        // otherwise quiet.
+        //
+        // The constraint only needs to apply where it does something for
+        // responsiveness: the primary domain, which is where interactive
+        // work is placed by design. Non-primary CPUs are left with no
+        // scheduler-imposed QoS request at all, so the platform's cpuidle
+        // governor picks the deepest state it predicts is safe based on
+        // actual idle duration — which, for a consolidated core, is
+        // usually long.
+        //
         // preset.idle_resume_us is always a concrete value (never the sentinel
         // IDLE_RESUME_PRESET) because LaptopPreset::build already resolved it.
         let applied_idle_resume_us = preset.idle_resume_us;
@@ -489,8 +511,14 @@ impl<'a> Scheduler<'a> {
             if !cpu_idle_resume_latency_supported() {
                 warn!("idle resume latency QoS not supported on this kernel");
             } else {
-                info!("setting idle QoS to {} µs", applied_idle_resume_us);
+                info!(
+                    "setting idle QoS to {} µs on primary domain (0x{:x})",
+                    applied_idle_resume_us, domain
+                );
                 for cpu in topo.all_cpus.values() {
+                    if !domain.test_cpu(cpu.id) {
+                        continue;
+                    }
                     update_cpu_idle_resume_latency(
                         cpu.id,
                         applied_idle_resume_us.try_into().unwrap(),
