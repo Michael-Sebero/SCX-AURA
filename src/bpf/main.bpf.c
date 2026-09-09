@@ -567,7 +567,19 @@ static s32 smt_sibling(s32 cpu)
 	struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
 	if (!cctx) return cpu;
 	smt = cast_mask(cctx->smt);
-	if (!smt) return cpu;
+	/*
+	 * Bug fix: a CPU with no SMT sibling (e.g. an E-core on a hybrid P+E
+	 * laptop) still has cctx->smt allocated by enable_sibling_cpu() at
+	 * init -- it's just left empty, since there is no sibling bit to
+	 * set. bpf_cpumask_first() on an empty mask returns an out-of-range
+	 * index, and bpf_cpumask_test_cpu() treats any out-of-range index as
+	 * "not set" (i.e. "not idle"). Left unhandled, is_smt_contended()
+	 * then reads that as "my sibling is busy" for every non-SMT core,
+	 * as long as any CPU anywhere is idle -- which is true almost all of
+	 * the time, so every E-core would look permanently SMT-contended.
+	 * Treat an empty mask the same as no mask at all.
+	 */
+	if (!smt || bpf_cpumask_empty(smt)) return cpu;
 	return bpf_cpumask_first(smt);
 }
 
@@ -693,14 +705,23 @@ static u32 timely_update_gain(struct task_ctx *tctx, u64 now)
 				gain, grad);
 		} else if (grad < 0 && grad_abs > timely_gradient_margin_ns) {
 			/*
-			 * Delay falling: recover gain cautiously using
-			 * backoff_low_fp as a multiplicative recovery floor.
+			 * Delay falling: recover gain cautiously, only while
+			 * still below backoff_low_fp's fraction of max gain.
 			 * This prevents gain from climbing too fast after a
 			 * high-delay episode and causing renewed congestion.
+			 *
+			 * Bug fix: rec_floor was computed from `gain` itself
+			 * (gain * backoff_low_fp / FP_ONE), so with
+			 * backoff_low_fp < FP_ONE, rec_floor <= gain always
+			 * -- "if (gain >= rec_floor)" could never be false,
+			 * so the rate limit this was meant to apply never
+			 * actually gated anything. Derive the floor from the
+			 * configured ceiling instead, so it's an actual bound
+			 * independent of the current gain.
 			 */
-			u32 rec_floor = (u32)((u64)gain *
+			u32 rec_floor = (u32)((u64)timely_gain_max_fp *
 					      timely_backoff_low_fp / FP_ONE);
-			if (gain >= rec_floor)
+			if (gain < rec_floor)
 				gain += timely_gain_step_fp / 2;
 			__sync_fetch_and_add(
 				&nr_delay_fast_recovery_dispatches, 1);
@@ -1232,7 +1253,15 @@ static u64 task_slice(const struct task_struct *p, s32 cpu)
 		      scx_bpf_dsq_nr_queued(tier_dsq(TIER_DEFAULT)) +
 		      scx_bpf_dsq_nr_queued(tier_dsq(TIER_BACKGROUND));
 	u64 slice = scale_by_task_weight(p, slice_max) / MAX(nr_wait, 1);
-	return MAX(slice, slice_min);
+	/*
+	 * Bug fix: this only floored at slice_min, with no ceiling.
+	 * scale_by_task_weight() scales *up* with p->scx.weight, so a
+	 * negative-nice (high-weight) task with little contention could get
+	 * a slice many times slice_max -- the opposite of what "slice_max"
+	 * (a configured maximum) promises, and directly hurts interactivity.
+	 * timely_task_slice() already clamps correctly; match it here.
+	 */
+	return CLAMP(slice, slice_min, slice_max);
 }
 
 /* ─── Idle CPU selection ─────────────────────────────────────────────────── */
@@ -1560,21 +1589,32 @@ s32 BPF_STRUCT_OPS(aura_select_cpu, struct task_struct *p,
 	/* Waker-bias: pull wakee toward a faster waker CPU. */
 	if (primary_all && is_wakeup(wake_flags) && is_this_cpu_allowed &&
 	    is_cpu_faster(this_cpu, prev_cpu)) {
+		/*
+		 * Bug fix: this fast path is supposed to place the wakee on
+		 * the faster *waker* CPU (this_cpu) -- that's the entire
+		 * point of "waker-bias". It was testing/dispatching to
+		 * prev_cpu instead, which is guaranteed slower than this_cpu
+		 * (that's what the is_cpu_faster() guard above just
+		 * established), so the fast path was pinning wakees to the
+		 * CPU it exists to steer them away from. The fallback below
+		 * (`prev_cpu = this_cpu`) already assumed this_cpu was the
+		 * real target, which is what gave this away.
+		 */
 		if (cpus_share_cache(this_cpu, prev_cpu) &&
-		    !is_smt_contended(prev_cpu) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		    !is_smt_contended(this_cpu) &&
+		    scx_bpf_test_and_clear_cpu_idle(this_cpu)) {
 			if (tctx) {
 				tctx->tier = tier;
 				scx_bpf_dsq_insert_vtime(
-					p, cpu_dsq(prev_cpu),
-					effective_slice(tctx, p, prev_cpu, enqueue_ts),
-					task_dl(p, prev_cpu, tctx, tier), 0);
+					p, cpu_dsq(this_cpu),
+					effective_slice(tctx, p, this_cpu, enqueue_ts),
+					task_dl(p, this_cpu, tctx, tier), 0);
 				__sync_fetch_and_add(&nr_direct_dispatches, 1);
 				__sync_fetch_and_add(&nr_waker_cpu_biases, 1);
 				dbg_msg("waker-bias: pid %d → cpu %d",
-					p->pid, prev_cpu);
+					p->pid, this_cpu);
 			}
-			return prev_cpu;
+			return this_cpu;
 		}
 		prev_cpu = this_cpu;
 	}
@@ -1633,14 +1673,30 @@ void BPF_STRUCT_OPS(aura_enqueue, struct task_struct *p, u64 enq_flags)
 
 	tier = task_tier(p, tctx);
 	if (is_pcpu_task(p)) {
-		if (local_pcpu)
+		if (local_pcpu) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
 					   task_slice(p, prev_cpu), enq_flags);
-		else
+		} else {
+			/*
+			 * Bug fix: task_dl() bakes tier_vtime_base[tier] for
+			 * this freshly computed `tier` into dsq_vtime here,
+			 * but tctx->tier was never updated to match (every
+			 * other vtime-dispatch path in this file sets
+			 * tctx->tier in the same step it calls task_dl()).
+			 * aura_stopping()/aura_running() strip
+			 * tier_vtime_base[tctx->tier] afterward -- with a
+			 * stale tctx->tier they strip the wrong tier's base,
+			 * corrupting dsq_vtime. (The local_pcpu branch above
+			 * deliberately leaves tctx->tier untouched, matching
+			 * SCX_DSQ_LOCAL insert() which also never touches
+			 * dsq_vtime -- only this branch needs the update.)
+			 */
+			tctx->tier = tier;
 			scx_bpf_dsq_insert_vtime(p, cpu_dsq(prev_cpu),
 						 effective_slice(tctx, p, prev_cpu, enqueue_ts),
 						 task_dl(p, prev_cpu, tctx, tier),
 						 enq_flags);
+		}
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 		return;
 	}
@@ -1778,7 +1834,7 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct task_struct *p_cpu, *p_iact, *p_def, *p_bg, *winner;
 	struct cpu_ctx *cctx;
-	u64 win_dsq, now;
+	u64 win_dsq, win_dl, now;
 	bool wcel_def, wcel_bg;
 
 	if (is_throttled()) return;
@@ -1938,12 +1994,27 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	winner  = NULL;
 	win_dsq = 0;
+	win_dl  = 0;
 
-#define MAYBE_WIN(cand, dsq_id) do {				\
-	if ((cand) && is_deadline_min((cand), winner)) {	\
-		winner  = (cand);				\
-		win_dsq = (dsq_id);				\
-	}							\
+/*
+ * Bug fix: both macros now compare candidates against win_dl -- the
+ * *effective* deadline that made the current winner win -- instead of
+ * re-reading winner->scx.dsq_vtime. Re-reading the real field discarded
+ * MAYBE_WIN_WCEL's synthetic zero deadline the moment a WCEL-forced
+ * candidate became winner: a later MAYBE_WIN_WCEL call would then compare
+ * against that winner's real (non-zero) vtime instead of the 0 it actually
+ * won with. In practice this meant BACKGROUND (evaluated last) would
+ * always displace an already-WCEL-forced DEFAULT whenever both tiers were
+ * simultaneously WCEL-expired, inverting the tier priority WCEL is
+ * supposed to preserve. Tracking win_dl explicitly keeps every comparison
+ * on the same basis regardless of which macro produced the current winner.
+ */
+#define MAYBE_WIN(cand, dsq_id) do {					\
+	if ((cand) && (!winner || (cand)->scx.dsq_vtime < win_dl)) {	\
+		winner  = (cand);					\
+		win_dsq = (dsq_id);					\
+		win_dl  = (cand)->scx.dsq_vtime;			\
+	}								\
 } while (0)
 
 /*
@@ -1953,10 +2024,11 @@ void BPF_STRUCT_OPS(aura_dispatch, s32 cpu, struct task_struct *prev)
 #define MAYBE_WIN_WCEL(cand, dsq_id, wcel_active) do {			\
 	if ((cand)) {							\
 		u64 _dl = (wcel_active) ? 0ULL : (cand)->scx.dsq_vtime;	\
-		if (!winner || _dl < winner->scx.dsq_vtime) {			\
-			winner  = (cand);					\
-			win_dsq = (dsq_id);					\
-		}								\
+		if (!winner || _dl < win_dl) {				\
+			winner  = (cand);				\
+			win_dsq = (dsq_id);				\
+			win_dl  = _dl;					\
+		}							\
 	}								\
 } while (0)
 
@@ -2239,10 +2311,18 @@ void BPF_STRUCT_OPS(aura_exit_task, struct task_struct *p,
 void BPF_STRUCT_OPS(aura_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
-	if (timely_enabled) {
-		scx_bpf_reenqueue_local();
-		__sync_fetch_and_add(&nr_cpu_release_reenqueue, 1);
-	}
+	/*
+	 * Bug fix: this was gated on timely_enabled, but TIMELY is off by
+	 * default (opt-in via -T). Whenever this CPU is taken away by a
+	 * higher scheduling class, any task still sitting in its local DSQ
+	 * needs to be moved to a shared DSQ or it is stranded there -- with
+	 * TIMELY off that reenqueue never happened, so the stranded task(s)
+	 * could sit unscheduled until the CPU comes back under sched_ext,
+	 * risking a watchdog-triggered scheduler ejection. This has nothing
+	 * to do with TIMELY and must run unconditionally.
+	 */
+	scx_bpf_reenqueue_local();
+	__sync_fetch_and_add(&nr_cpu_release_reenqueue, 1);
 }
 
 /* ─── Syscall progs ─────────────────────────────────────────────────────── */

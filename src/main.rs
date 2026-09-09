@@ -815,25 +815,28 @@ impl<'a> Scheduler<'a> {
     }
 
     fn refresh_sched_domain(&mut self) -> bool {
-        if self.power_profile != PowerProfile::Unknown {
-            let power_profile = Self::power_profile();
-            if power_profile != self.power_profile {
-                self.power_profile = power_profile;
+        // Minor fix: this used to skip the check entirely whenever the
+        // *current* profile was already Unknown, so a system that hadn't
+        // reported a profile yet at startup (e.g. power-profiles-daemon
+        // not up yet) could never subsequently pick one up. Always poll;
+        // the cost is one cheap query per second either way.
+        let power_profile = Self::power_profile();
+        if power_profile != self.power_profile {
+            self.power_profile = power_profile;
 
-                // Rebuild the preset with the new power profile and restart
-                // so rodata and the energy domain are recomputed.
-                if self.opts.primary_domain == PRIMARY_DOMAIN_PRESET
-                    || self.opts.primary_domain == "auto"
-                {
-                    return true;
-                }
-                if let Err(err) = Self::init_cpufreq_perf(
-                    &mut self.skel,
-                    &self.opts.primary_domain,
-                    !self.opts.no_cpufreq,
-                ) {
-                    warn!("failed to refresh cpufreq level: {}", err);
-                }
+            // Rebuild the preset with the new power profile and restart
+            // so rodata and the energy domain are recomputed.
+            if self.opts.primary_domain == PRIMARY_DOMAIN_PRESET
+                || self.opts.primary_domain == "auto"
+            {
+                return true;
+            }
+            if let Err(err) = Self::init_cpufreq_perf(
+                &mut self.skel,
+                &self.opts.primary_domain,
+                !self.opts.no_cpufreq,
+            ) {
+                warn!("failed to refresh cpufreq level: {}", err);
             }
         }
         false
