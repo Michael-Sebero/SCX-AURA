@@ -24,6 +24,20 @@ enum consts {
 	CLOCK_BOOTTIME		= 7,
 };
 
+/*
+ * QoS tiers, highest priority first. They map onto the XNU Clutch
+ * timeshare root buckets FG, DF, UT and BG. NR_TIERS must stay a power of
+ * two: tier indexes are masked with (NR_TIERS - 1) to bound array accesses
+ * for the verifier.
+ */
+enum aura_tier {
+	TIER_INTERACTIVE	= 0,
+	TIER_DEFAULT		= 1,
+	TIER_UTILITY		= 2,
+	TIER_BACKGROUND		= 3,
+	NR_TIERS		= 4,
+};
+
 #ifndef __VMLINUX_H__
 typedef unsigned char u8;
 typedef unsigned short u16;

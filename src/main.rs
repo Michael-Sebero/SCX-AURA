@@ -2,10 +2,8 @@
 //
 // Copyright (c) 2024 Andrea Righi <andrea.righi@linux.dev>
 //
-// Laptop-optimised fork.  Running `scx_aura` with no arguments loads a
-// laptop preset (see LaptopPreset) that enables fast responsiveness and
-// longer battery life out of the box.  Every preset value can be overridden
-// by the corresponding CLI flag.
+// Laptop-oriented fork of scx_bpfland. The command-line defaults form the
+// laptop preset; every value can be overridden.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -13,26 +11,35 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
-use std::ffi::{c_int, c_ulong};
+use std::cmp::Reverse;
+use std::ffi::c_int;
 use std::fmt::Write;
+use std::fs;
 use std::mem::MaybeUninit;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use clap::Parser;
+use clap::ValueEnum;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
-use log::warn;
-use log::{debug, info};
+use log::{debug, info, warn};
 use scx_stats::prelude::*;
-use scx_utils::autopower::{fetch_power_profile, PowerProfile};
+use scx_utils::CoreType;
+use scx_utils::Cpumask;
+use scx_utils::NR_CPU_IDS;
+use scx_utils::Powermode;
+use scx_utils::Topology;
+use scx_utils::UserExitInfo;
+use scx_utils::autopower::{PowerProfile, fetch_power_profile};
 use scx_utils::build_id;
 use scx_utils::compat;
 use scx_utils::get_primary_cpus;
@@ -44,40 +51,21 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
-use scx_utils::Cpumask;
-use scx_utils::Powermode;
-use scx_utils::Topology;
-use scx_utils::UserExitInfo;
-use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_aura";
+const MAX_CPUS: usize = 1024;
+const POWER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const GOVERNOR_PATH: &str = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor";
 
-// ── Sentinel values for "user did not set this flag" ─────────────────────────
-//
-// SetTrue flags default to false, so a bare bool is enough to distinguish
-// "off by default" from "explicitly set".  For numeric and string flags that
-// the preset wants to override we use explicit sentinel constants.
-
-/// Sentinel for idle_resume_us: means "let the preset decide".
-const IDLE_RESUME_PRESET: i64 = i64::MIN;
-
-/// Sentinel for primary_domain: means "let the preset decide".
-const PRIMARY_DOMAIN_PRESET: &str = "preset";
-
-/// Sentinel for slice_us: means "let the preset decide".
-const SLICE_US_PRESET: u64 = u64::MAX;
-
-fn cpus_to_cpumask(cpus: &Vec<usize>) -> String {
+fn cpus_to_cpumask(cpus: &[usize]) -> String {
     if cpus.is_empty() {
         return String::from("none");
     }
     let max_cpu_id = *cpus.iter().max().unwrap();
-    let mut bitmask = vec![0u8; (max_cpu_id + 1 + 7) / 8];
+    let mut bitmask = vec![0u8; (max_cpu_id + 1).div_ceil(8)];
     for cpu_id in cpus {
-        let byte_index = cpu_id / 8;
-        let bit_index = cpu_id % 8;
-        bitmask[byte_index] |= 1 << bit_index;
+        bitmask[cpu_id / 8] |= 1 << (cpu_id % 8);
     }
     let hex_str: String = bitmask.iter().rev().fold(String::new(), |mut f, byte| {
         let _ = write!(&mut f, "{:02x}", byte);
@@ -86,185 +74,95 @@ fn cpus_to_cpumask(cpus: &Vec<usize>) -> String {
     format!("0x{}", hex_str)
 }
 
-// ── Laptop preset ─────────────────────────────────────────────────────────────
-//
-// Built once in Scheduler::init after topology and power-profile detection.
-// Holds the *effective* value of every tunable: preset default if the user
-// did not supply a flag, user-supplied value otherwise.
-//
-// Preset rationale (what each choice does and why):
-//
-//  primary_domain = "performance"
-//      On heterogeneous CPUs (Intel P+E, AMD multi-CCD) this puts P-cores /
-//      high-efficiency cores first in the idle selection path, which works
-//      in concert with E-core consolidation: both mechanisms push work toward
-//      higher-capacity cores and let lower-capacity cores sleep.  On
-//      homogeneous CPUs `get_primary_cpus(Performance)` returns all cores so
-//      the behaviour is identical to "all".
-//
-//  cpufreq = true
-//      Lets the scheduler drive per-CPU frequency based on measured
-//      utilisation via scx_bpf_cpuperf_set().  Without this the governor
-//      makes frequency decisions independently of the scheduler's placement
-//      choices, undermining E-core consolidation.
-//
-//  sticky_tasks = true
-//      Short-runtime tasks (avg_runtime < 10 µs) are dispatched directly to
-//      SCX_DSQ_LOCAL rather than being migrated.  This keeps frequently-
-//      waking interactive tasks on a warm cache and prevents the CPU from
-//      bouncing between C-states on every short wakeup.
-//
-//  idle_resume_us = 1000
-//      Sets a 1 ms PM QoS latency constraint on every CPU.  This permits
-//      deep C-states (C6 on Intel ~130 µs, CC6 on AMD ~150 µs) while
-//      blocking pathological deep states (C10, PC10) whose exit latencies
-//      exceed 1 ms and add visible latency to interactive events.
-//      Restored to per-CPU hardware default on scheduler exit.
-//
-//  local_pcpu = true
-//      Single-CPU-affinity tasks dispatch directly to SCX_DSQ_LOCAL,
-//      avoiding the shared DSQ overhead for tasks that can never migrate.
-//
-//  slice_us = 800
-//      Slightly shorter than the upstream 1000 µs default.  Combined with
-//      the 40 ms lag window, this gives interactive tasks more scheduling
-//      opportunities per second while keeping context-switch overhead low.
-//
-//  preferred_idle_scan = true
-//      Uses the capacity-sorted preferred_cpus[] scan for idle CPU
-//      selection instead of scx_bpf_select_cpu_and(), giving deterministic
-//      P-core-first placement that the kernel helper cannot guarantee.
-//
-// Everything else (TIMELY, NUMA, SMT, group_iact, warp, ecore_consolidate)
-// keeps its existing default (TIMELY off, NUMA/SMT auto-detected, laptop
-// features on).
-
-#[derive(Debug)]
-struct LaptopPreset {
-    // scheduling
-    slice_us:          u64,
-    slice_min_us:      u64,
-    slice_us_lag:      u64,
-    sticky_tasks:      bool,
-    local_pcpu:        bool,
-    local_kthreads:    bool,
-    no_wake_sync:      bool,
-    // CPU placement
-    primary_domain:    String,
-    preferred_idle_scan: bool,
-    cpufreq:           bool,
-    // power management
-    idle_resume_us:    i64,
-    // laptop features (all on by default; negated by --no-* flags)
-    group_iact:        bool,
-    ecore_consolidate: bool,
-    warp:              bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PowerMode {
+    /// Follow power-profiles-daemon, or the cpufreq energy performance preference.
+    Auto,
+    Performance,
+    Balanced,
+    Powersave,
 }
 
-impl LaptopPreset {
-    fn build(opts: &Opts, _topo: &Topology) -> Self {
-        // ── slice ──────────────────────────────────────────────────────────
-        let slice_us = if opts.slice_us == SLICE_US_PRESET {
-            800   // preset: slightly shorter for more interactive opportunities
-        } else {
-            opts.slice_us
-        };
+/// Power policy pushed to BPF. Frequencies are fractions of a CPU's maximum
+/// frequency out of 1024 and only apply with the schedutil governor; 0
+/// disables a floor or cap.
+struct PowerPolicy {
+    iact_floor: u32,
+    util_cap: u32,
+    bg_cap: u32,
+    bg_strict: bool,
+    util_prefer_little: bool,
+}
 
-        // ── primary domain ─────────────────────────────────────────────────
-        //
-        // Detect whether the CPU is heterogeneous by checking if any CPU has
-        // a capacity different from cpu 0.  On homogeneous CPUs "performance"
-        // resolves to all cores; on heterogeneous ones it selects P-cores.
-        let primary_domain = if opts.primary_domain == PRIMARY_DOMAIN_PRESET {
-            "performance".to_string()
-        } else {
-            opts.primary_domain.clone()
-        };
+impl PowerMode {
+    fn resolve(self, profile: PowerProfile) -> PowerMode {
+        match self {
+            PowerMode::Auto => match profile {
+                PowerProfile::Performance => PowerMode::Performance,
+                PowerProfile::Powersave => PowerMode::Powersave,
+                PowerProfile::Balanced { .. } | PowerProfile::Unknown => PowerMode::Balanced,
+            },
+            mode => mode,
+        }
+    }
 
-        // ── idle resume latency ────────────────────────────────────────────
-        let idle_resume_us = if opts.idle_resume_us == IDLE_RESUME_PRESET {
-            1000   // preset: allow C6 (~150 µs exit), block C10 (>1 ms exit)
-        } else {
-            opts.idle_resume_us
-        };
+    fn policy(self) -> PowerPolicy {
+        match self {
+            PowerMode::Performance => PowerPolicy {
+                iact_floor: 1024,
+                util_cap: 0,
+                bg_cap: 0,
+                bg_strict: false,
+                util_prefer_little: false,
+            },
+            PowerMode::Balanced | PowerMode::Auto => PowerPolicy {
+                iact_floor: 768,
+                util_cap: 0,
+                bg_cap: 512,
+                bg_strict: false,
+                util_prefer_little: false,
+            },
+            PowerMode::Powersave => PowerPolicy {
+                iact_floor: 512,
+                util_cap: 768,
+                bg_cap: 384,
+                bg_strict: true,
+                util_prefer_little: true,
+            },
+        }
+    }
 
-        // ── boolean flags: preset supplies true, --flag overrides to false ─
-        //
-        // The pattern: opts.flag is `false` when not supplied (SetTrue),
-        // so `!opts.disable_X` gives the user a way to opt out while keeping
-        // the preset default.
-        //
-        // For flags that are opt-in (SetTrue) in the original, the preset
-        // supplies true and the user can't easily override to false without
-        // a new --no-X flag.  Those are added as --no-sticky-tasks etc.
-        let sticky_tasks       = !opts.no_sticky_tasks;
-        let local_pcpu         = !opts.no_local_pcpu;
-        let preferred_idle_scan = !opts.no_preferred_idle_scan;
-        let cpufreq            = !opts.no_cpufreq;
-
-        // ── opts pass-through ──────────────────────────────────────────────
-        let local_kthreads = opts.local_kthreads;
-        let no_wake_sync   = opts.no_wake_sync;
-        let group_iact     = !opts.no_group_iact;
-        let ecore_consolidate = !opts.no_ecore_consolidate;
-        let warp           = !opts.no_warp;
-
-        // Log the active preset.
-        info!(
-            "laptop preset: slice={}µs primary={} sticky={} local_pcpu={} \
-             pref_scan={} cpufreq={} idle_resume={}µs \
-             group_iact={} ecore={} warp={}",
-            slice_us, primary_domain, sticky_tasks, local_pcpu,
-            preferred_idle_scan, cpufreq, idle_resume_us,
-            group_iact, ecore_consolidate, warp,
-        );
-
-        LaptopPreset {
-            slice_us,
-            slice_min_us:    opts.slice_min_us,
-            slice_us_lag:    opts.slice_us_lag,
-            sticky_tasks,
-            local_pcpu,
-            local_kthreads,
-            no_wake_sync,
-            primary_domain,
-            preferred_idle_scan,
-            cpufreq,
-            idle_resume_us,
-            group_iact,
-            ecore_consolidate,
-            warp,
+    fn index(self) -> u64 {
+        match self {
+            PowerMode::Performance => 0,
+            PowerMode::Balanced | PowerMode::Auto => 1,
+            PowerMode::Powersave => 2,
         }
     }
 }
 
-// ── CLI definition ────────────────────────────────────────────────────────────
-//
-// Flags that existed in the original aura are kept with the same short
-// names and semantics.  New --no-X flags allow opting out of preset defaults
-// that were previously opt-in SetTrue flags.
-
-/// scx_aura: vruntime-based sched_ext scheduler optimised for laptops.
+/// scx_aura: laptop-oriented sched_ext scheduler with XNU-style QoS tiers.
 ///
-/// Running with no arguments loads a laptop preset:
-///   sticky tasks on, local pcpu on, preferred idle scan on, cpufreq on,
-///   primary domain = performance, idle resume latency = 1000 µs.
-///
-/// All preset values can be individually overridden.
+/// Tasks are sorted into interactive, default, utility and background tiers,
+/// scheduled with the XNU Clutch root-bucket algorithm (per-tier latency
+/// bounds, warp and starvation avoidance). On hybrid CPUs, interactive work
+/// prefers performance cores and background work prefers efficiency cores.
+/// With the schedutil governor the scheduler also drives CPU frequency.
+/// The defaults are the laptop preset.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Exit debug dump buffer length. 0 indicates default.
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
 
-    /// Maximum scheduling slice in microseconds.
-    /// Default (preset): 800 µs.
-    #[clap(short = 's', long, default_value_t = SLICE_US_PRESET,
-           hide_default_value = true)]
+    /// Maximum scheduling slice in microseconds. The per-tier latency bounds,
+    /// warp budgets and starvation windows scale with it (XNU's values are
+    /// defined for a 10 ms quantum).
+    #[clap(short = 's', long, default_value = "800")]
     slice_us: u64,
 
-    /// Minimum scheduling slice in microseconds (0 = disabled).
-    #[clap(short = 'L', long, default_value = "0")]
+    /// Minimum scheduling slice in microseconds.
+    #[clap(short = 'L', long, default_value = "250")]
     slice_min_us: u64,
 
     /// Maximum time slice lag in microseconds.
@@ -275,26 +173,36 @@ struct Opts {
     #[clap(short = 't', long, default_value = "0")]
     throttle_us: u64,
 
-    /// CPU idle QoS resume latency in microseconds.
-    /// Default (preset): 1000 µs (permits C6, blocks C10).
-    /// Pass -1 to disable entirely.
-    #[clap(short = 'I', long, allow_hyphen_values = true,
-           default_value_t = IDLE_RESUME_PRESET, hide_default_value = true)]
+    /// Idle QoS resume latency limit in microseconds for the primary domain
+    /// (-1 = disabled).
+    ///
+    /// The limit only excludes idle states whose exit latency is higher.
+    /// Deepest core C-states on current laptop CPUs exit in a few hundred
+    /// microseconds, so low values cost battery and high ones do nothing.
+    #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "-1")]
     idle_resume_us: i64,
 
-    /// Primary scheduling domain (bitmask, or: auto/performance/powersave/turbo/all).
-    /// Default (preset): performance (P-cores first on heterogeneous CPUs).
-    #[clap(short = 'm', long, default_value = PRIMARY_DOMAIN_PRESET,
-           hide_default_value = true)]
+    /// Primary scheduling domain: a hex cpumask, or auto, performance,
+    /// powersave, turbo, all.
+    #[clap(short = 'm', long, default_value = "performance")]
     primary_domain: String,
 
-    // ── opt-in flags (unchanged from upstream) ────────────────────────────
+    /// Power policy (frequency floors and caps, background core confinement).
+    /// auto follows power-profiles-daemon, or the cpufreq energy performance
+    /// preference when the daemon is not running.
+    #[clap(long, value_enum, default_value_t = PowerMode::Auto)]
+    power_mode: PowerMode,
+
+    /// Override the detected efficiency (little) cores with a hex cpumask,
+    /// or "none".
+    #[clap(long)]
+    little_cpus: Option<String>,
 
     /// Enable kthreads prioritization (EXPERIMENTAL).
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
-    /// Disable direct dispatch during synchronous wakeups.
+    /// Ignore synchronous wakeups (kernel idle CPU selection only).
     #[clap(short = 'w', long, action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
@@ -306,96 +214,77 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     disable_numa: bool,
 
-    /// Enable TIMELY adaptive time-slice feedback.
-    #[clap(short = 'T', long, action = clap::ArgAction::SetTrue)]
-    timely: bool,
-
-    /// TIMELY lower delay threshold in microseconds.
-    #[clap(long, default_value = "5000")]
-    timely_tlow_us: u64,
-
-    /// TIMELY higher delay threshold in microseconds.
-    #[clap(long, default_value = "50000")]
-    timely_thigh_us: u64,
-
-    /// TIMELY minimum gain value (fixed-point).
-    #[clap(long, default_value = "128")]
-    timely_gain_min: u32,
-
-    /// TIMELY gain step (fixed-point).
-    #[clap(long, default_value = "32")]
-    timely_gain_step: u32,
-
-    /// TIMELY HAI threshold (fixed-point).
-    #[clap(long, default_value = "768")]
-    timely_hai_thresh: u32,
-
-    /// TIMELY HAI multiplier.
-    #[clap(long, default_value = "2")]
-    timely_hai_multiplier: u32,
-
-    /// TIMELY backoff low (fixed-point).
-    #[clap(long, default_value = "768")]
-    timely_backoff_low: u32,
-
-    /// TIMELY backoff high (fixed-point).
-    #[clap(long, default_value = "960")]
-    timely_backoff_high: u32,
-
-    /// TIMELY backoff gradient (fixed-point).
-    #[clap(long, default_value = "992")]
-    timely_backoff_gradient: u32,
-
-    /// TIMELY gradient margin in microseconds.
-    #[clap(long, default_value = "125")]
-    timely_gradient_margin_us: u64,
-
-    /// TIMELY control interval in microseconds.
-    #[clap(long, default_value = "500")]
-    timely_control_interval_us: u64,
-
-    // ── opt-out flags (preset on, --no-X to disable) ──────────────────────
-    //
-    // These replace the old SetTrue opt-in flags for sticky_tasks,
-    // local_pcpu, preferred_idle_scan, and cpufreq.  The old short flags
-    // (-S, -p, -P, -f) are kept as aliases on the --no- variants' inverses
-    // to avoid breaking existing scripts that used them.
-
-    /// Disable sticky-task dispatch (preset: on).
-    /// Sticky tasks: short-runtime tasks are dispatched to their previous CPU
-    /// without entering the shared DSQ, preserving cache warmth.
+    /// Disable sticky tasks (tasks averaging under 10 us of CPU time per
+    /// wakeup stay on their CPU).
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_sticky_tasks: bool,
 
-    /// Disable per-CPU task local dispatch (preset: on).
+    /// Queue single-CPU tasks in their tier instead of dispatching them
+    /// straight to their CPU.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_local_pcpu: bool,
 
-    /// Disable capacity-sorted preferred idle CPU scan (preset: on).
-    /// When on, idle CPU selection walks CPUs in descending capacity order
-    /// (P-cores first) instead of using scx_bpf_select_cpu_and().
+    /// Use the kernel's idle CPU selection instead of the capacity-ordered
+    /// scan.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_preferred_idle_scan: bool,
 
-    /// Disable scheduler-driven CPU frequency scaling (preset: on).
-    /// When on, the scheduler adjusts per-CPU frequency via
-    /// scx_bpf_cpuperf_set() based on measured utilisation.
+    /// Do not drive CPU frequency. The cpuperf target then stays at its
+    /// kernel default (maximum), which pins schedutil at maximum frequency.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_cpufreq: bool,
 
-    /// Disable per-process-group interactivity scoring (preset: on).
+    /// Disable thread-group interactivity scoring.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_group_iact: bool,
 
-    /// Disable E-core idle consolidation (preset: on).
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    no_ecore_consolidate: bool,
+    /// Disable core-type placement on hybrid CPUs.
+    #[clap(long, alias = "no-ecore-consolidate", action = clap::ArgAction::SetTrue)]
+    no_qos_placement: bool,
 
-    /// Disable interactive-tier warp dispatch (preset: on).
+    /// Disable warp (higher tiers running ahead of the EDF choice).
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_warp: bool,
 
-    // ── standard ──────────────────────────────────────────────────────────
+    /// Enable TIMELY adaptive time slices.
+    #[clap(short = 'T', long, action = clap::ArgAction::SetTrue)]
+    timely: bool,
+
+    /// TIMELY low queueing-delay threshold in microseconds.
+    #[clap(long, default_value = "5000")]
+    timely_tlow_us: u64,
+
+    /// TIMELY high queueing-delay threshold in microseconds.
+    #[clap(long, default_value = "50000")]
+    timely_thigh_us: u64,
+
+    /// TIMELY minimum slice gain (fixed point, 1024 = 1.0).
+    #[clap(long, default_value = "128")]
+    timely_gain_min: u32,
+
+    /// TIMELY additive gain step (fixed point).
+    #[clap(long, default_value = "32")]
+    timely_gain_step: u32,
+
+    /// Consecutive non-rising delay samples before hyperactive increase.
+    #[clap(long, default_value = "5")]
+    timely_hai_thresh: u32,
+
+    /// Gain step multiplier in hyperactive increase.
+    #[clap(long, default_value = "2")]
+    timely_hai_multiplier: u32,
+
+    /// TIMELY multiplicative decrease factor (fixed point, 819 = 0.8).
+    #[clap(long, default_value = "819")]
+    timely_beta: u32,
+
+    /// Delay gradient normalization in microseconds.
+    #[clap(long, default_value = "125")]
+    timely_gradient_margin_us: u64,
+
+    /// Minimum interval between gain updates of a task, in microseconds.
+    #[clap(long, default_value = "500")]
+    timely_control_interval_us: u64,
 
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
@@ -430,10 +319,10 @@ struct Scheduler<'a> {
     struct_ops: Option<libbpf_rs::Link>,
     opts: &'a Opts,
     topo: Topology,
-    /// Effective idle_resume_us that was applied (may differ from opts if
-    /// preset supplied the value).  Stored so Drop can restore it correctly.
-    applied_idle_resume_us: i64,
+    qos_cpus: Vec<usize>,
     power_profile: PowerProfile,
+    power_mode: PowerMode,
+    last_power_poll: Instant,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
 }
@@ -443,7 +332,6 @@ impl<'a> Scheduler<'a> {
         try_set_rlimit_infinity();
 
         let topo = Topology::new().unwrap();
-
         let smt_enabled = !opts.disable_smt && topo.smt_enabled;
 
         let nr_nodes = topo
@@ -452,80 +340,42 @@ impl<'a> Scheduler<'a> {
             .filter(|node| !node.all_cpus.is_empty())
             .count();
         info!("NUMA nodes: {}", nr_nodes);
-
         let numa_enabled = !opts.disable_numa && nr_nodes > 1;
         if !numa_enabled {
             info!("Disabling NUMA optimizations");
         }
 
-        let power_profile = Self::power_profile();
-
-        // Build the effective configuration from the laptop preset + any
-        // user overrides.  This must happen before rodata is written.
-        let preset = LaptopPreset::build(opts, &topo);
-
         info!(
-            "{} {}",
+            "{} {} {}",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
+            if smt_enabled { "SMT on" } else { "SMT off" }
         );
-        info!("scheduler options: {}", std::env::args().collect::<Vec<_>>().join(" "));
+        info!(
+            "scheduler options: {}",
+            std::env::args().collect::<Vec<_>>().join(" ")
+        );
 
-        // Resolve the primary domain using the preset's value.
-        let domain = Self::resolve_energy_domain(&preset.primary_domain, power_profile)
+        let power_profile = Self::power_profile();
+        let power_mode = opts.power_mode.resolve(power_profile);
+        let domain = Self::resolve_energy_domain(&opts.primary_domain, power_profile)
             .map_err(|err| {
                 anyhow!(
                     "failed to resolve primary domain '{}': {}",
-                    &preset.primary_domain,
+                    opts.primary_domain,
                     err
                 )
             })?;
 
-        // Apply idle resume latency QoS.
-        //
-        // Audit fix (battery/sleep pass): this used to loop over
-        // topo.all_cpus.values() unconditionally, applying the same tight
-        // latency constraint to every CPU in the system. That directly
-        // fights the E-core consolidation logic elsewhere in this
-        // scheduler, whose entire point is to let non-primary cores sit
-        // idle for as long as possible: capping their allowed resume
-        // latency at the same ~1 ms as the interactive P-cores means they
-        // can never enter a deeper C-state than C6 even while
-        // consolidation is actively parking them, and (on platforms where
-        // package-level idle requires every core to be deep enough) can
-        // block PC10/full-package idle even when the whole system is
-        // otherwise quiet.
-        //
-        // The constraint only needs to apply where it does something for
-        // responsiveness: the primary domain, which is where interactive
-        // work is placed by design. Non-primary CPUs are left with no
-        // scheduler-imposed QoS request at all, so the platform's cpuidle
-        // governor picks the deepest state it predicts is safe based on
-        // actual idle duration — which, for a consolidated core, is
-        // usually long.
-        //
-        // preset.idle_resume_us is always a concrete value (never the sentinel
-        // IDLE_RESUME_PRESET) because LaptopPreset::build already resolved it.
-        let applied_idle_resume_us = preset.idle_resume_us;
-        if applied_idle_resume_us >= 0 {
-            if !cpu_idle_resume_latency_supported() {
-                warn!("idle resume latency QoS not supported on this kernel");
-            } else {
-                info!(
-                    "setting idle QoS to {} µs on primary domain (0x{:x})",
-                    applied_idle_resume_us, domain
-                );
-                for cpu in topo.all_cpus.values() {
-                    if !domain.test_cpu(cpu.id) {
-                        continue;
-                    }
-                    update_cpu_idle_resume_latency(
-                        cpu.id,
-                        applied_idle_resume_us.try_into().unwrap(),
-                    )?;
-                }
-            }
-        }
+        let little = Self::little_cpus(opts, &topo)?;
+        let hybrid = !opts.no_qos_placement
+            && !little.is_empty()
+            && little.len() < topo.all_cpus.len();
+        info!(
+            "little CPUs: {} (core-type placement {})",
+            cpus_to_cpumask(&little),
+            if hybrid { "on" } else { "off" }
+        );
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
@@ -534,54 +384,57 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.aura_ops_mut().exit_dump_len = opts.exit_dump_len;
 
-        // Write all rodata from the preset, not directly from opts.
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
-        rodata.debug              = opts.debug;
-        rodata.smt_enabled        = smt_enabled;
-        rodata.numa_enabled       = numa_enabled;
-        rodata.local_pcpu         = preset.local_pcpu;
-        rodata.no_wake_sync       = preset.no_wake_sync;
-        rodata.sticky_tasks       = preset.sticky_tasks;
-        rodata.slice_max          = preset.slice_us * 1000;
-        rodata.slice_min          = preset.slice_min_us * 1000;
-        rodata.slice_lag          = preset.slice_us_lag * 1000;
-        rodata.throttle_ns        = opts.throttle_us * 1000;
-        rodata.primary_all        = domain.weight() == *NR_CPU_IDS;
-        rodata.preferred_idle_scan = preset.preferred_idle_scan;
-        rodata.local_kthreads     = preset.local_kthreads || opts.throttle_us > 0;
+        rodata.debug = opts.debug;
+        rodata.smt_enabled = smt_enabled;
+        rodata.numa_enabled = numa_enabled;
+        rodata.local_pcpu = !opts.no_local_pcpu;
+        rodata.no_wake_sync = opts.no_wake_sync;
+        rodata.sticky_tasks = !opts.no_sticky_tasks;
+        rodata.slice_max = opts.slice_us * 1000;
+        rodata.slice_min = opts.slice_min_us.min(opts.slice_us) * 1000;
+        rodata.slice_lag = opts.slice_us_lag * 1000;
+        rodata.throttle_ns = opts.throttle_us * 1000;
+        rodata.primary_all = domain.weight() == *NR_CPU_IDS;
+        rodata.preferred_idle_scan = !opts.no_preferred_idle_scan;
+        rodata.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
+        rodata.hybrid = hybrid;
+        rodata.group_iact_enabled = !opts.no_group_iact;
+        rodata.warp_enabled = !opts.no_warp;
 
-        // TIMELY (unchanged; user must opt in with -T).
-        rodata.timely_enabled             = opts.timely;
-        rodata.timely_tlow_ns             = opts.timely_tlow_us * 1000;
-        rodata.timely_thigh_ns            = opts.timely_thigh_us * 1000;
-        rodata.timely_gain_min_fp         = opts.timely_gain_min;
-        rodata.timely_gain_max_fp         = 1024;
-        rodata.timely_gain_step_fp        = opts.timely_gain_step;
-        rodata.timely_hai_thresh_fp       = opts.timely_hai_thresh;
-        rodata.timely_hai_multiplier      = opts.timely_hai_multiplier;
-        rodata.timely_backoff_low_fp      = opts.timely_backoff_low;
-        rodata.timely_backoff_high_fp     = opts.timely_backoff_high;
-        rodata.timely_backoff_gradient_fp = opts.timely_backoff_gradient;
-        rodata.timely_gradient_margin_ns  = opts.timely_gradient_margin_us * 1000;
+        rodata.timely_enabled = opts.timely;
+        rodata.timely_tlow_ns = opts.timely_tlow_us * 1000;
+        rodata.timely_thigh_ns = opts.timely_thigh_us * 1000;
+        rodata.timely_gain_min_fp = opts.timely_gain_min.clamp(1, 1024);
+        rodata.timely_gain_step_fp = opts.timely_gain_step;
+        rodata.timely_hai_thresh = opts.timely_hai_thresh.max(1);
+        rodata.timely_hai_multiplier = opts.timely_hai_multiplier.max(1);
+        rodata.timely_beta_fp = opts.timely_beta.min(1024);
+        rodata.timely_gradient_margin_ns = opts.timely_gradient_margin_us.max(1) * 1000;
         rodata.timely_control_interval_ns = opts.timely_control_interval_us * 1000;
 
-        // Laptop features.
-        rodata.group_iact_enabled = preset.group_iact;
-        rodata.ecore_consolidate  = preset.ecore_consolidate;
-        rodata.warp_enabled       = preset.warp;
-
-        // CPU capacity array and preferred scan order (descending capacity).
+        // Big cores first, then by capacity: the BPF side scans this list
+        // forward for performance placement and backward for efficiency.
         let mut cpus: Vec<_> = topo.all_cpus.values().collect();
-        cpus.sort_by_key(|cpu| std::cmp::Reverse(cpu.cpu_capacity));
+        cpus.sort_by_key(|cpu| (little.contains(&cpu.id), Reverse(cpu.cpu_capacity), cpu.id));
+        cpus.truncate(MAX_CPUS);
         for (i, cpu) in cpus.iter().enumerate() {
-            rodata.cpu_capacity[cpu.id] = cpu.cpu_capacity as c_ulong;
-            rodata.preferred_cpus[i]    = cpu.id as u64;
+            rodata.preferred_cpus[i] = cpu.id as u64;
+            if cpu.id < MAX_CPUS && little.contains(&cpu.id) {
+                rodata.cpu_little[cpu.id] = 1;
+            }
         }
-        if preset.preferred_idle_scan {
-            info!(
-                "preferred CPUs (capacity-sorted): {:?}",
-                &rodata.preferred_cpus[0..cpus.len()]
-            );
+        rodata.nr_preferred = cpus.len() as u32;
+        info!(
+            "CPU scan order: {:?}",
+            cpus.iter().map(|cpu| cpu.id).collect::<Vec<_>>()
+        );
+
+        // ops.cpu_release() is deprecated once scx_bpf_reenqueue_local() can be
+        // called from any context; use the sched_switch hook there instead.
+        if scx_utils::ksym_exists("scx_bpf_reenqueue_local___v2").unwrap_or(false) {
+            skel.struct_ops.aura_ops_mut().cpu_release = std::ptr::null_mut();
+            skel.progs.aura_sched_switch.set_autoload(true);
         }
 
         skel.struct_ops.aura_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
@@ -593,49 +446,136 @@ impl<'a> Scheduler<'a> {
             } else {
                 0
             };
-        info!("scheduler flags: {:#x}", skel.struct_ops.aura_ops_mut().flags);
+        info!(
+            "scheduler flags: {:#x}",
+            skel.struct_ops.aura_ops_mut().flags
+        );
 
         let mut skel = scx_ops_load!(skel, aura_ops, uei)?;
 
         Self::init_energy_domain(&mut skel, &domain).map_err(|err| {
-            anyhow!(
-                "failed to initialise primary domain 0x{:x}: {}",
-                domain,
-                err
-            )
+            anyhow!("failed to initialize primary domain 0x{:x}: {}", domain, err)
         })?;
 
-        // Drive cpufreq from the preset value.
-        if let Err(err) = Self::init_cpufreq_perf(
-            &mut skel,
-            &preset.primary_domain,
-            preset.cpufreq,
-        ) {
-            bail!("failed to initialise cpufreq performance level: {}", err);
-        }
+        skel.maps.bss_data.as_mut().unwrap().cpufreq_perf_lvl =
+            if opts.no_cpufreq { 1024 } else { -1 };
+        Self::report_cpufreq(opts);
+        Self::apply_power_policy(&mut skel, power_mode);
+        info!("power mode: {:?} (profile: {})", power_mode, power_profile);
 
         if smt_enabled {
             Self::init_smt_domains(&mut skel, &topo)?;
         }
 
-        let struct_ops   = Some(scx_ops_attach!(skel, aura_ops)?);
+        let struct_ops = Some(scx_ops_attach!(skel, aura_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
+
+        // Last, so that no earlier failure can leave the limit applied.
+        let qos_cpus = Self::apply_idle_qos(opts, &topo, &domain)?;
 
         Ok(Self {
             skel,
             struct_ops,
             opts,
             topo,
-            applied_idle_resume_us,
+            qos_cpus,
             power_profile,
+            power_mode,
+            last_power_poll: Instant::now(),
             stats_server,
             user_restart: false,
         })
     }
 
+    fn apply_idle_qos(opts: &Opts, topo: &Topology, domain: &Cpumask) -> Result<Vec<usize>> {
+        let mut applied = Vec::new();
+        if opts.idle_resume_us < 0 {
+            return Ok(applied);
+        }
+        if !cpu_idle_resume_latency_supported() {
+            warn!("idle resume latency QoS not supported");
+            return Ok(applied);
+        }
+        let limit: i32 = opts.idle_resume_us.try_into()?;
+        for cpu in topo.all_cpus.values().filter(|cpu| domain.test_cpu(cpu.id)) {
+            if let Err(err) = update_cpu_idle_resume_latency(cpu.id, limit) {
+                Self::restore_idle_qos(topo, &applied);
+                return Err(err);
+            }
+            applied.push(cpu.id);
+        }
+        info!(
+            "idle resume latency limited to {} us on {}",
+            limit,
+            cpus_to_cpumask(&applied)
+        );
+        Ok(applied)
+    }
+
+    fn restore_idle_qos(topo: &Topology, cpus: &[usize]) {
+        for &cpu in cpus {
+            let Some(orig) = topo.all_cpus.get(&cpu) else {
+                continue;
+            };
+            if let Err(err) =
+                update_cpu_idle_resume_latency(cpu, orig.pm_qos_resume_latency_us as i32)
+            {
+                warn!("failed to restore idle resume latency of CPU {}: {}", cpu, err);
+            }
+        }
+    }
+
+    fn little_cpus(opts: &Opts, topo: &Topology) -> Result<Vec<usize>> {
+        match opts.little_cpus.as_deref() {
+            Some("none") => Ok(Vec::new()),
+            Some(mask) => {
+                let mask = Cpumask::from_str(mask)?;
+                Ok(topo
+                    .all_cpus
+                    .keys()
+                    .copied()
+                    .filter(|&cpu| mask.test_cpu(cpu))
+                    .collect())
+            }
+            None => Ok(topo
+                .all_cpus
+                .values()
+                .filter(|cpu| cpu.core_type == CoreType::Little)
+                .map(|cpu| cpu.id)
+                .collect()),
+        }
+    }
+
+    fn apply_power_policy(skel: &mut BpfSkel<'_>, mode: PowerMode) {
+        let policy = mode.policy();
+        let bss = skel.maps.bss_data.as_mut().unwrap();
+        bss.perf_iact_floor = policy.iact_floor;
+        bss.perf_util_cap = policy.util_cap;
+        bss.perf_bg_cap = policy.bg_cap;
+        bss.bg_strict = policy.bg_strict;
+        bss.util_prefer_little = policy.util_prefer_little;
+    }
+
+    fn report_cpufreq(opts: &Opts) {
+        if opts.no_cpufreq {
+            info!("cpufreq: disabled, cpuperf target left at maximum");
+            return;
+        }
+        match fs::read_to_string(GOVERNOR_PATH) {
+            Ok(gov) if gov.trim() == "schedutil" => info!("cpufreq: driving schedutil"),
+            Ok(gov) => info!(
+                "cpufreq: governor is {}; frequency targets only apply with schedutil",
+                gov.trim()
+            ),
+            Err(_) => info!("cpufreq: no cpufreq policy found"),
+        }
+    }
+
     fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
         let prog = &mut skel.progs.enable_primary_cpu;
-        let mut args = cpu_arg { cpu_id: cpu as c_int };
+        let mut args = cpu_arg {
+            cpu_id: cpu as c_int,
+        };
         let input = ProgramInput {
             context_in: Some(unsafe {
                 std::slice::from_raw_parts_mut(
@@ -662,17 +602,17 @@ impl<'a> Scheduler<'a> {
 
     fn resolve_energy_domain(primary_domain: &str, power_profile: PowerProfile) -> Result<Cpumask> {
         let domain = match primary_domain {
-            "powersave"   => Self::epp_to_cpumask(Powermode::Powersave)?,
+            "powersave" => Self::epp_to_cpumask(Powermode::Powersave)?,
             "performance" => Self::epp_to_cpumask(Powermode::Performance)?,
-            "turbo"       => Self::epp_to_cpumask(Powermode::Turbo)?,
-            "auto"        => match power_profile {
+            "turbo" => Self::epp_to_cpumask(Powermode::Turbo)?,
+            "auto" => match power_profile {
                 PowerProfile::Powersave => Self::epp_to_cpumask(Powermode::Powersave)?,
                 PowerProfile::Balanced { .. }
                 | PowerProfile::Performance
                 | PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
-            &_    => Cpumask::from_str(primary_domain)?,
+            &_ => Cpumask::from_str(primary_domain)?,
         };
         Ok(domain)
     }
@@ -683,35 +623,13 @@ impl<'a> Scheduler<'a> {
             bail!("failed to reset primary domain: error {}", err);
         }
         for cpu in 0..*NR_CPU_IDS {
-            if domain.test_cpu(cpu) {
-                if let Err(err) = Self::enable_primary_cpu(skel, cpu as i32) {
-                    bail!("failed to add CPU {} to primary domain: error {}", cpu, err);
-                }
+            if !domain.test_cpu(cpu) {
+                continue;
+            }
+            if let Err(err) = Self::enable_primary_cpu(skel, cpu as i32) {
+                bail!("failed to add CPU {} to primary domain: error {}", cpu, err);
             }
         }
-        Ok(())
-    }
-
-    fn init_cpufreq_perf(
-        skel: &mut BpfSkel<'_>,
-        primary_domain: &str,
-        cpufreq: bool,
-    ) -> Result<()> {
-        let perf_lvl: i64 = match (cpufreq, primary_domain) {
-            (false, _)            => 1024,  // fixed max; governor controls freq
-            (true, "powersave")   => 0,     // fixed min
-            (true, _)             => -1,    // dynamic utilisation-based
-        };
-        info!(
-            "cpufreq performance level: {}",
-            match perf_lvl {
-                1024       => "max (cpufreq off)".into(),
-                0          => "min".into(),
-                n if n < 0 => "auto (utilisation-based)".into(),
-                _          => perf_lvl.to_string(),
-            }
-        );
-        skel.maps.bss_data.as_mut().unwrap().cpufreq_perf_lvl = perf_lvl;
         Ok(())
     }
 
@@ -741,63 +659,57 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<(), std::io::Error> {
+    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<()> {
         let smt_siblings = topo.sibling_cpus();
         info!("SMT sibling CPUs: {:?}", smt_siblings);
-        for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
-            Self::enable_sibling_cpu(skel, cpu, *sibling_cpu as usize).unwrap();
+        for (cpu, &sibling) in smt_siblings.iter().enumerate() {
+            if sibling < 0 {
+                continue;
+            }
+            Self::enable_sibling_cpu(skel, cpu, sibling as usize).map_err(|err| {
+                anyhow!("failed to set SMT sibling of CPU {}: error {}", cpu, err)
+            })?;
         }
         Ok(())
     }
 
     fn get_metrics(&self) -> Metrics {
         let bss = self.skel.maps.bss_data.as_ref().unwrap();
+        let tier = |counters: &[u64], t: aura_tier| counters[t as usize];
+        let running = |t: aura_tier| bss.nr_tier_running[t as usize].max(0) as u64;
         Metrics {
-            nr_running:                         bss.nr_running,
-            nr_cpus:                            bss.nr_online_cpus,
-            nr_kthread_dispatches:              bss.nr_kthread_dispatches,
-            nr_direct_dispatches:               bss.nr_direct_dispatches,
-            nr_shared_dispatches:               bss.nr_shared_dispatches,
-            nr_delay_recovery_dispatches:       bss.nr_delay_recovery_dispatches,
-            nr_delay_middle_add_dispatches:     bss.nr_delay_middle_add_dispatches,
-            nr_delay_fast_recovery_dispatches:  bss.nr_delay_fast_recovery_dispatches,
-            nr_delay_rate_limited_dispatches:   bss.nr_delay_rate_limited_dispatches,
-            nr_gain_floor_dispatches:           bss.nr_gain_floor_dispatches,
-            nr_gain_ceiling_dispatches:         bss.nr_gain_ceiling_dispatches,
-            nr_delay_low_region_samples:        bss.nr_delay_low_region_samples,
-            nr_delay_mid_region_samples:        bss.nr_delay_mid_region_samples,
-            nr_delay_high_region_samples:       bss.nr_delay_high_region_samples,
-            nr_gain_floor_resident_samples:     bss.nr_gain_floor_resident_samples,
-            nr_gain_mid_resident_samples:       bss.nr_gain_mid_resident_samples,
-            nr_gain_ceiling_resident_samples:   bss.nr_gain_ceiling_resident_samples,
-            nr_idle_select_path_picks:          bss.nr_idle_select_path_picks,
-            nr_idle_enqueue_path_picks:         bss.nr_idle_enqueue_path_picks,
-            nr_idle_prev_cpu_picks:             bss.nr_idle_prev_cpu_picks,
-            nr_idle_primary_picks:              bss.nr_idle_primary_picks,
-            nr_idle_spill_picks:                bss.nr_idle_spill_picks,
-            nr_idle_pick_failures:              bss.nr_idle_pick_failures,
-            nr_idle_primary_domain_misses:      bss.nr_idle_primary_domain_misses,
-            nr_idle_global_misses:              bss.nr_idle_global_misses,
-            nr_waker_cpu_biases:                bss.nr_waker_cpu_biases,
-            nr_keep_running_reuses:             bss.nr_keep_running_reuses,
-            nr_keep_running_queue_empty:        bss.nr_keep_running_queue_empty,
-            nr_keep_running_smt_blocked:        bss.nr_keep_running_smt_blocked,
-            nr_keep_running_queued_work:        bss.nr_keep_running_queued_work,
-            nr_dispatch_cpu_dsq_consumes:       bss.nr_dispatch_cpu_dsq_consumes,
-            nr_dispatch_node_dsq_consumes:      bss.nr_dispatch_node_dsq_consumes,
-            nr_cpu_release_reenqueue:           bss.nr_cpu_release_reenqueue,
-            // laptop counters
-            nr_interactive_dispatches:          bss.nr_interactive_dispatches,
-            nr_background_dispatches:           bss.nr_background_dispatches,
-            nr_warp_dispatches:                 bss.nr_warp_dispatches,
-            nr_default_warp_dispatches:         bss.nr_default_warp_dispatches,
-            nr_iact_promoted:                   bss.nr_iact_promoted,
-            nr_iact_demoted:                    bss.nr_iact_demoted,
-            nr_ecore_consolidations:            bss.nr_ecore_consolidations,
-            nr_ecore_rebalance_pulls:           bss.nr_ecore_rebalance_pulls,
-            nr_preempt_kicks:                   bss.nr_preempt_kicks,
-            nr_wcel_enforcements:               bss.nr_wcel_enforcements,
-            nr_starvation_window_opens:         bss.nr_starvation_window_opens,
+            nr_running: bss.nr_running,
+            nr_cpus: bss.nr_online_cpus,
+            power_mode: self.power_mode.index(),
+            cpus_iact: running(aura_tier_TIER_INTERACTIVE),
+            cpus_def: running(aura_tier_TIER_DEFAULT),
+            cpus_util: running(aura_tier_TIER_UTILITY),
+            cpus_bg: running(aura_tier_TIER_BACKGROUND),
+            nr_direct_dispatches: bss.nr_direct_dispatches,
+            nr_local_dispatches: bss.nr_local_dispatches,
+            nr_keep_running: bss.nr_keep_running,
+            nr_iact_enqueues: tier(&bss.nr_tier_enqueues, aura_tier_TIER_INTERACTIVE),
+            nr_def_enqueues: tier(&bss.nr_tier_enqueues, aura_tier_TIER_DEFAULT),
+            nr_util_enqueues: tier(&bss.nr_tier_enqueues, aura_tier_TIER_UTILITY),
+            nr_bg_enqueues: tier(&bss.nr_tier_enqueues, aura_tier_TIER_BACKGROUND),
+            nr_iact_dispatches: tier(&bss.nr_tier_dispatches, aura_tier_TIER_INTERACTIVE),
+            nr_def_dispatches: tier(&bss.nr_tier_dispatches, aura_tier_TIER_DEFAULT),
+            nr_util_dispatches: tier(&bss.nr_tier_dispatches, aura_tier_TIER_UTILITY),
+            nr_bg_dispatches: tier(&bss.nr_tier_dispatches, aura_tier_TIER_BACKGROUND),
+            nr_sel_natural: bss.nr_sel_natural,
+            nr_sel_warp: bss.nr_sel_warp,
+            nr_sel_starve_open: bss.nr_sel_starve_open,
+            nr_sel_starve: bss.nr_sel_starve,
+            nr_preempt_kicks: bss.nr_preempt_kicks,
+            nr_mig_up: bss.nr_mig_up,
+            nr_mig_down: bss.nr_mig_down,
+            nr_mig_smt: bss.nr_mig_smt,
+            nr_promotions: bss.nr_promotions,
+            nr_demotions: bss.nr_demotions,
+            nr_reenq: bss.nr_reenq,
+            nr_timely_inc: bss.nr_timely_inc,
+            nr_timely_dec: bss.nr_timely_dec,
+            nr_timely_hai: bss.nr_timely_hai,
         }
     }
 
@@ -814,30 +726,34 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn refresh_sched_domain(&mut self) -> bool {
-        // Minor fix: this used to skip the check entirely whenever the
-        // *current* profile was already Unknown, so a system that hadn't
-        // reported a profile yet at startup (e.g. power-profiles-daemon
-        // not up yet) could never subsequently pick one up. Always poll;
-        // the cost is one cheap query per second either way.
-        let power_profile = Self::power_profile();
-        if power_profile != self.power_profile {
-            self.power_profile = power_profile;
+    /// Track power profile changes. Returns true when the scheduler must be
+    /// restarted, which is only needed when the primary domain follows the
+    /// profile; everything else is updated in place.
+    fn refresh_power(&mut self) -> bool {
+        let auto_domain = self.opts.primary_domain == "auto";
+        if self.opts.power_mode != PowerMode::Auto && !auto_domain {
+            return false;
+        }
+        if self.last_power_poll.elapsed() < POWER_POLL_INTERVAL {
+            return false;
+        }
+        self.last_power_poll = Instant::now();
 
-            // Rebuild the preset with the new power profile and restart
-            // so rodata and the energy domain are recomputed.
-            if self.opts.primary_domain == PRIMARY_DOMAIN_PRESET
-                || self.opts.primary_domain == "auto"
-            {
-                return true;
-            }
-            if let Err(err) = Self::init_cpufreq_perf(
-                &mut self.skel,
-                &self.opts.primary_domain,
-                !self.opts.no_cpufreq,
-            ) {
-                warn!("failed to refresh cpufreq level: {}", err);
-            }
+        let profile = Self::power_profile();
+        if profile == self.power_profile {
+            return false;
+        }
+        info!("power profile: {} -> {}", self.power_profile, profile);
+        self.power_profile = profile;
+        if auto_domain {
+            return true;
+        }
+
+        let mode = self.opts.power_mode.resolve(profile);
+        if mode != self.power_mode {
+            self.power_mode = mode;
+            Self::apply_power_policy(&mut self.skel, mode);
+            info!("power mode: {:?}", mode);
         }
         false
     }
@@ -845,14 +761,14 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            if self.refresh_sched_domain() {
+            if self.refresh_power() {
                 self.user_restart = true;
                 break;
             }
             match req_ch.recv_timeout(Duration::from_secs(1)) {
-                Ok(())  => res_ch.send(self.get_metrics())?,
+                Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(e)  => Err(e)?,
+                Err(e) => Err(e)?,
             }
         }
         let _ = self.struct_ops.take();
@@ -863,19 +779,7 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {SCHEDULER_NAME} scheduler");
-        // Restore per-CPU idle resume latency to hardware default.
-        // We use applied_idle_resume_us (which is what was actually set,
-        // whether from the preset or the user) rather than opts.idle_resume_us
-        // (which may still be the sentinel IDLE_RESUME_PRESET).
-        if self.applied_idle_resume_us >= 0 && cpu_idle_resume_latency_supported() {
-            for cpu in self.topo.all_cpus.values() {
-                update_cpu_idle_resume_latency(
-                    cpu.id,
-                    cpu.pm_qos_resume_latency_us as i32,
-                )
-                .unwrap();
-            }
-        }
+        Self::restore_idle_qos(&self.topo, &self.qos_cpus);
     }
 }
 
@@ -911,7 +815,7 @@ fn main() -> Result<()> {
         simplelog::ColorChoice::Auto,
     )?;
 
-    let shutdown       = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         shutdown_clone.store(true, Ordering::Relaxed);
@@ -922,7 +826,7 @@ fn main() -> Result<()> {
         let shutdown_copy = shutdown.clone();
         let jh = std::thread::spawn(move || {
             match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
-                Ok(_)  => debug!("stats monitor thread finished"),
+                Ok(_) => debug!("stats monitor thread finished"),
                 Err(e) => warn!("stats monitor thread error: {}", e),
             }
         });
