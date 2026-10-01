@@ -2,366 +2,435 @@
 
 **Adaptive · Utilisation · Responsive · Architecture**
 
-> **ABSTRACT**: `scx_aura` is a BPF CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx), designed for **laptop workloads** that demand both low-latency responsiveness and long battery life. It classifies every task by observed sleep and CPU behaviour, routes work through a 3-tier priority system, and actively manages CPU placement and frequency to keep efficiency cores idle.
+> **ABSTRACT**: `scx_aura` is a BPF CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx) for **laptop workloads** that need both low-latency responsiveness and long battery life. It sorts every task into one of four QoS tiers modelled on Apple XNU's Clutch scheduler, picks which tier runs next with XNU's root-bucket algorithm, places work on performance or efficiency cores according to its tier and drives CPU frequency from frequency-invariant utilisation.
 >
-> - **3-Tier Classification** Tasks sorted into Interactive / Default / Background by per-process sleep-to-CPU ratio and per-task wakeup frequency
-> - **Bounded Starvation Avoidance** Each tier has a hard latency budget (0 ms / 75 ms / 250 ms); an expired budget wins dispatch unconditionally only if nothing higher is runnable — otherwise it's granted a single bounded quantum before the decision is re-evaluated, so a lower tier can never monopolize the CPU once a higher tier is also waiting
-> - **Depleting Warp Budget** Each tier gets a per-tier budget (8 ms / 2 ms / 0 ms) to preempt EDF ordering ahead of lower tiers; the budget drains in real time while spent and only refills when the tier wins its next dispatch fairly, so sustained arrivals can never warp indefinitely
-> - **Adaptive Time-Slice Feedback** Per-task queue delay drives a fixed-point gain that scales each task's slice up or down; gradient detection and a high-activity-index streak catch rising and sustained congestion
-> - **E-Core Idle Consolidation with Passive Rebalance** When the system is below 75% load, all tiers avoid efficiency cores at enqueue time, and an idle performance core will reclaim work already sitting on an efficiency core's queue rather than let it sit there while the P-core idles
-> - **Per-Process Interactivity Scoring** Each process group accumulates CPU-used and voluntary-sleep time; the ratio updates a 0–16 score that drives tier placement and decays over time so past behaviour does not permanently define a group
+> - **4-Tier QoS** Interactive / Default / Utility / Background, mapped to XNU's FG / DF / UT / BG root buckets
+> - **Clutch Root-Bucket Selection** Earliest-deadline-first across tiers using XNU's worst-case execution latencies, depleting warp budgets and one-quantum starvation-avoidance windows, evaluated in XNU's order
+> - **Behavioural Classification** CPU time per wakeup, wakeup rate and an XNU thread-group interactivity score, with hysteresis so tasks near a threshold do not flip tiers
+> - **Interactive Preemption** A waking interactive task that finds no idle CPU takes the CPU running the lowest tier, big cores first; the preempted task resumes there with only its remaining slice
+> - **AMP Placement** Background work prefers efficiency cores and is confined to them in powersave mode; misplaced work moves or swaps cores at quantum expiry, as in XNU's Edge scheduler
+> - **CLPC-Style Frequency Control** With schedutil, per-CPU frequency targets come from utilisation, with a floor for interactive work and caps for utility and background work
+> - **Live Power Modes** Performance / balanced / powersave, following power-profiles-daemon or the energy performance preference, applied without restarting the scheduler
 
 ## Navigation
 
 - [1. Quick Start](#1-quick-start)
 - [2. Philosophy](#2-philosophy)
-- [3. 3-Tier System](#3-3-tier-system)
-- [4. Warp Budget and Starvation Avoidance](#4-warp-budget-and-starvation-avoidance)
-- [5. Adaptive Time-Slice Feedback](#5-adaptive-time-slice-feedback)
-- [6. Power Management](#6-power-management)
-- [7. Architecture](#7-architecture)
-- [8. Default Preset](#8-default-preset)
-- [9. Options](#9-options)
-- [10. Overhead](#10-overhead)
-- [11. Vocabulary](#11-vocabulary)
+- [3. Tiers](#3-tiers)
+- [4. Root-Bucket Selection](#4-root-bucket-selection)
+- [5. Dispatch, Preemption and Resume](#5-dispatch-preemption-and-resume)
+- [6. Core Placement](#6-core-placement)
+- [7. Power Management](#7-power-management)
+- [8. Adaptive Time Slices (TIMELY)](#8-adaptive-time-slices-timely)
+- [9. Architecture](#9-architecture)
+- [10. Options](#10-options)
+- [11. Statistics](#11-statistics)
+- [12. Overhead](#12-overhead)
+- [13. Vocabulary](#13-vocabulary)
 
 ---
 
 ## 1. Quick Start
 
-```bash
-# Prerequisites: Linux Kernel 6.12+ with sched_ext, Rust toolchain
+Requirements: a kernel with sched_ext (`CONFIG_SCHED_CLASS_EXT=y`) and BTF, a Rust toolchain and clang. Tested on Linux 6.17 and 7.0 with BPF built by clang 18 and clang 20.
 
-# Clone and build
+```bash
 git clone https://github.com/Michael-Sebero/SCX-AURA
 cd SCX-AURA && cargo build --release
+sudo install -m 755 target/release/scx_aura /bin/scx_aura
+```
 
-# Install
-sudo mv target/release/scx_aura /bin/
-chmod 755 /bin/scx_aura
-
-# Run (requires root) — loads the laptop preset automatically
+```bash
+# Run with the laptop preset (requires root)
 sudo scx_aura
 
-# Performance cores only, no frequency scaling
-sudo scx_aura -m performance --no-cpufreq
+# Force a power mode instead of following the system profile
+sudo scx_aura --power-mode powersave
 
-# With adaptive time-slice feedback enabled
+# Hybrid CPU whose efficiency cores are not detected: CPUs 8-15 are E-cores
+sudo scx_aura --little-cpus 0xff00
+
+# Adaptive time slices
 sudo scx_aura --timely
 
-# Monitor live statistics
+# Live statistics, one line per second
 sudo scx_aura --stats 1
+```
+
+Check that it is active:
+
+```bash
+cat /sys/kernel/sched_ext/state /sys/kernel/sched_ext/root/ops
+```
+
+The scheduler runs in the foreground for as long as it is loaded. To start it at boot from an rc script, detach it:
+
+```bash
+( setsid nohup scx_aura >> /var/log/scx_aura.log 2>&1 & )
 ```
 
 ---
 
 ## 2. Philosophy
 
-Traditional schedulers (CFS, EEVDF) optimise for **fairness** — if a browser and a compiler both run, each gets roughly 50% CPU time. For interactive laptop use, this creates two problems:
+Fair schedulers (CFS, EEVDF) give a browser and a compiler roughly equal CPU time. On a laptop this causes two problems:
 
-1. **Latency inversion**: A 50 µs UI callback waits behind a 50 ms compile job
-2. **Power waste**: Waking an efficiency core for a brief interactive task prevents that core from reaching deep idle, burning power for no throughput gain
+1. **Latency inversion**: a 50 µs UI callback waits behind a compile job's slice
+2. **Power waste**: background work runs on performance cores at high frequency and work that could wait keeps big cores out of deep idle
 
-**scx_aura's answer**: Classify tasks by *behaviour* (how long they sleep versus how much CPU they use), not by type or nice value. Interactive tasks — those that sleep often and burst briefly — get priority dispatch and P-core placement. CPU-bound tasks get larger slices but lower priority and tolerate E-core placement. The system self-tunes: no manual cgroup setup, no taskset, no explicit game-mode profiles required.
+XNU solves this with QoS classes that applications declare. Linux has no QoS classes, so scx_aura infers them: explicit hints first (nice, `SCHED_BATCH`, `SCHED_IDLE`), then behaviour. Tasks that burst briefly and wake often are interactive; long-running tasks in CPU-bound process groups are utility; nice ≥ 10 and `SCHED_IDLE` are background. Each tier then gets XNU's treatment: a latency bound, a core class and a frequency policy. No cgroup setup, taskset or per-application profiles are needed.
 
 ---
 
-## 3. 3-Tier System
-
-Every task is classified into one of three tiers. Classification is continuous — tasks move between tiers as their behaviour changes.
+## 3. Tiers
 
 ### Tier Table
 
-| Tier | Name | Criteria | Budget | Examples |
-| :--- | :--- | :--- | :--- | :--- |
-| **T0** | Interactive | nice < −5, wakeup\_freq ≥ 16/100ms, or group score ≥ 12/16 | 0 ms (immediate) | Audio callbacks, UI threads, input handlers |
-| **T1** | Default | Everything else | 75 ms | Browser tabs, shell commands, video playback |
-| **T2** | Background | nice ≥ 10, or group score ≤ 4/16 | 250 ms | Compilers, package managers, background indexing |
+Latency bounds, warp budgets and starvation windows are XNU's values scaled by `slice_max / 10 ms`. The table shows them at the default 800 µs slice.
 
-T0 always runs before T1, which always runs before T2. This ordering is encoded in the virtual runtime key — lower tiers receive a fixed vtime offset of 400 ms per tier step, making cross-tier comparisons a plain `u64` less-than with no per-dispatch branching.
+| Tier | XNU bucket | Worst-case latency | Warp | Starvation window | Examples |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Interactive** | FG | 0 ms | 640 µs | 800 µs | Input handlers, audio callbacks, UI threads |
+| **Default** | DF | 6 ms | 160 µs | 800 µs | Shells, browsers, video playback |
+| **Utility** | UT | 12 ms | 80 µs | 320 µs | Compilers, encoders, `SCHED_BATCH` jobs |
+| **Background** | BG | 20 ms | 0 | 160 µs | nice ≥ 10, `SCHED_IDLE`, indexers |
 
-### Classification Priority
+XNU's unscaled values (10 ms quantum): latency 0 / 75 / 150 / 250 ms, warp 8 / 2 / 1 / 0 ms, quantum 10 / 10 / 4 / 2 ms.
 
-Tier assignment follows a strict priority chain for each task:
+### Classification
 
-1. **Nice hard limits** — `nice < −5` forces T0; `nice ≥ 10` forces T2. These override all other signals.
-2. **Per-task wakeup frequency** — tasks waking ≥ 16 times per 100 ms are placed in T0 regardless of process history. Catches audio and input threads in processes that also run CPU-bound work.
-3. **Per-process interactivity score** — each process group (by tgid) accumulates CPU-used time and voluntary sleep time. The score formula is:
-   - When `blocked ≥ used`: `score = 8 + 8 × (blocked − used) / blocked` (range 8–16, interactive)
-   - When `blocked < used`: `score = 8 × blocked / used` (range 0–8, CPU-bound)
-   - New groups start at score 16 (fully interactive) and decay toward their actual behaviour over 500 ms windows
-   - Score ≥ 12 → T0; score ≤ 4 → T2; otherwise T1
+Tiers are re-evaluated at every wakeup, enqueue and slice refill. The first matching rule wins:
 
-> [!TIP]
-> **No browser tab should stay in T2.** A tab that is actively rendering will wake frequently (T0 by wakeup frequency) or have a high sleep ratio (T0 by score). A tab that is genuinely idle will have a very low wakeup rate and a near-zero CPU-used accumulator, keeping its score high and its tier at T0 when it does wake. Only a tab doing sustained JS computation without sleeping (rare) will land in T1.
+1. `SCHED_IDLE` or nice ≥ 10 → **Background**. On a hybrid CPU, a task whose affinity excludes every efficiency core gets **Utility** instead.
+2. nice < −5 → **Interactive**
+3. `SCHED_BATCH` → **Utility**
+4. **Interactive** when the task's burst is at most `slice_max / 2` (400 µs) and either it wakes at least 16 times per 100 ms, or its process group's interactivity score is at least 12/16
+5. **Utility** when the group score is at most 4/16, the burst is at least `slice_max` and the task wakes fewer than 2 times per 100 ms
+6. Otherwise **Default**
 
-### Score Decay
+Staying in a behavioural tier takes looser thresholds than entering it:
 
-The per-process score is recalculated every time the process's on-CPU time crosses a 500 ms window boundary. At that point both accumulators (CPU-used and blocked-accum) are divided by 10 and the window generation counter advances. This means a process that was CPU-bound for 500 ms but then becomes interactive recovers its score within the next 500 ms window — old behaviour does not permanently suppress the tier.
+| Tier | Enter | Stay |
+| :--- | :--- | :--- |
+| Interactive | burst ≤ 400 µs, wakeups ≥ 16/100 ms or score ≥ 12 | burst ≤ 800 µs, wakeups ≥ 8/100 ms or score ≥ 10 |
+| Utility | burst ≥ 800 µs, wakeups < 2/100 ms, score ≤ 4 | burst ≥ 400 µs, wakeups < 4/100 ms, score ≤ 6 |
+
+### Bursts and Wakeup Rate
+
+A **burst** is the CPU time a task uses between two wakeups. Being preempted does not end a burst, so a CPU-bound task never looks bursty however often it is interrupted. Classification uses the larger of the burst average (EWMA, α = 1/4) and the burst in progress. New tasks start with an average of one full slice, so they become interactive only after their wakeups show short bursts.
+
+The wakeup rate is an EWMA of wakeups per 100 ms, updated at each wakeup and capped at 64. Because it only changes on wakeups, it is also bounded by `100 ms / burst in progress`: a task that stops sleeping loses its wakeup credit instead of keeping it forever.
+
+### Thread-Group Interactivity Score
+
+Each process (by tgid) accumulates CPU-used and blocked time, where blocked means no thread of the process is runnable. The score is XNU's `sched_clutch_interactivity_from_cpu_data()`:
+
+- `blocked > used`: `score = 8 + 8 × (blocked − used) / blocked` (8–16, interactive)
+- otherwise: `score = 8 × blocked / used` (0–8, CPU-bound)
+
+When used + blocked reaches 500 ms, both are divided by 10, so only recent behaviour counts. As in XNU, a new process starts fully interactive (500 ms blocked, score 16) and moves toward its real behaviour as it runs. Scores live in an 8192-entry LRU hash keyed by tgid; the group leader's start time detects tgid reuse.
 
 ---
 
-## 4. Warp Budget and Starvation Avoidance
+## 4. Root-Bucket Selection
 
-`scx_aura` lets a tier jump ahead of normal EDF ordering through two related but distinct mechanisms: a **depleting warp budget** (a tier spending its own allowance to preempt) and a **bounded starvation-avoidance window** (a tier being granted one quantum because it has aged past its latency budget). Both are modeled on the equivalent mechanisms in XNU's Clutch scheduler, and both are deliberately *bounded* — neither can let a tier monopolize the CPU indefinitely.
+Each tier has a shared dispatch queue ordered by bpfland's virtual deadline. Which tier a CPU consumes from next is chosen by XNU's `sched_clutch_root_highest_root_bucket()`, over the tiers that have queued work or that the CPU's current task belongs to.
 
-### Warp Budget
+Each tier has a **deadline**: the time it became runnable or was last selected, plus its worst-case latency. Selection runs in this order:
 
-Each tier holds a per-tier budget that lets it jump ahead of lower tiers in the EDF race. The budget is shared across CPUs (not per-CPU), drains in real time while a tier is actively using it, and is only refilled when the tier wins its next dispatch *fairly* — on deadline alone, without spending warp. A tier with continuous arrivals cannot warp forever: once its budget is exhausted, it falls back to normal EDF until it earns a fair win and refills.
+1. **Starvation window open**: if the earliest-deadline tier is inside a starvation-avoidance window, it is selected.
+2. **Natural order**: if the earliest-deadline tier is also the highest runnable tier, it is selected. Its deadline moves out by its latency bound and its warp budget is refilled.
+3. **Warp**: otherwise, the highest tier above it that has warp left is selected. The first warp selection opens a window as long as the remaining budget; the budget is spent in wall time and is gone when the window closes.
+4. **Starvation avoidance**: otherwise, the earliest-deadline tier is selected and a starvation window of one tier quantum opens. When the window closes, its deadline moves out by its latency bound.
 
-| Tier | Warp budget | Can warp over |
-| :--- | :--- | :--- |
-| Interactive | 8 ms | Default, Background |
-| Default | 2 ms | Background only |
-| Background | 0 ms | — (never warps) |
+The warp budget is refilled only by a natural-order selection, so a tier with continuous arrivals cannot run ahead indefinitely. When a tier's queue empties during an open warp window, the unused part is kept for its next runnable period. All root-bucket state is global and protected by one spin lock.
 
-Warp is only attempted when there is actually something to jump ahead of — if the lower tiers are empty, normal EDF already dispatches the higher tier next, so no budget is spent. Warp also never overrides a task already placed directly on a CPU's own per-CPU dispatch queue (sticky tasks, kthreads, migration-pinned tasks) if that task's own deadline is earlier — those placements are never preempted by a tier's warp shortcut.
+Within a tier, tasks are ordered by vruntime plus the vruntime accumulated since their last wakeup, with sleep credit bounded by `slice_lag` scaled by the wakeup rate. Each tier has its own vruntime clock; a task changing tier keeps its lag relative to the clock, clamped to `±slice_lag`.
 
-### Starvation Avoidance
+---
 
-Independent of warp, each tier has a hard latency budget enforced by tracking the wall-clock timestamp of the oldest task in each tier's queue.
+## 5. Dispatch, Preemption and Resume
 
-| Tier | Latency budget |
+### Slice Expiry
+
+When the running task's slice expires, `ops.dispatch()` charges its runtime, re-classifies it and runs root-bucket selection with the task's tier included:
+
+| Outcome | What happens to the running task |
 | :--- | :--- |
-| Interactive | 0 ms (always wins) |
-| Default | 75 ms |
-| Background | 250 ms |
+| Its own tier is selected and it is within one slice of the queue head's deadline | Keeps the CPU with a new slice |
+| A lower tier gets an EDF or starvation turn | Resumes on the same CPU right after that turn |
+| A higher tier is selected | Goes back to its tier queue and competes again |
+| Its tier is selected but another task's deadline is earlier by more than a slice | Goes back to its tier queue |
 
-When a tier's head task ages past its budget, what happens next depends on whether anything *higher* is currently runnable:
+Slices are `slice_max` scaled by task weight, divided by the number of queued tasks and clamped to `[slice_min, slice_max]` (250–800 µs by default).
 
-- **Nothing higher runnable:** the aged tier wins dispatch unconditionally — there is nothing to bound against, so this matches XNU's natural-order selection.
-- **A higher tier is also runnable:** the aged tier is instead granted a single **1 ms starvation-avoidance window**. It wins dispatch for the duration of that window, then the decision is re-evaluated from scratch. If the tier is still starved on the next pass, a fresh window opens. This gives the aged tier roughly one quantum each time it reaches the front of the queue, rather than letting it lock out higher tiers for as long as its head stays old.
+### Interactive Preemption
 
-The starvation timestamp only clears when the tier's queue becomes empty, so the budget correctly tracks the age of the queue's oldest waiting task, not just the most recently dispatched one.
+A waking interactive task first looks for an idle CPU. If there is none, it takes a CPU running a lower tier: its previous CPU if that is a big core running lower-tier work, otherwise the big core running the lowest tier, otherwise a little core. It is inserted at the head of that CPU's local queue with `SCX_ENQ_PREEMPT`.
+
+The preempted task goes back onto that CPU's local queue behind it, with only the slice it had left, so a preemption never grants extra CPU time.
+
+### Other Local Placements
+
+- **Sticky tasks**: tasks averaging under 10 µs of CPU time per wakeup stay on their CPU (`--no-sticky-tasks` to disable)
+- **Per-CPU tasks**: tasks pinned to one CPU or with migration disabled go straight to that CPU (`--no-local-pcpu` to disable)
+- **Higher scheduling classes**: when an RT or deadline task takes a CPU, the tasks waiting in its local queue are re-enqueued so they can run elsewhere. On kernels with `scx_bpf_reenqueue_local___v2` this runs from a `sched_switch` tracepoint; older kernels use `ops.cpu_release()`.
+
+Any task inserted into a tier queue kicks an idle CPU that could run it.
 
 ---
 
-## 5. Adaptive Time-Slice Feedback
+## 6. Core Placement
 
-Enabled with `--timely`. Each task maintains a fixed-point gain value (`gain_fp`, range 128–1024, representing 0.125×–1.0× of `slice_max`) that scales its slice. The gain is updated once per `control_interval_ns` (default 500 µs) based on measured queue delay.
+Efficiency cores are detected from the kernel's core types; `--little-cpus` overrides the detection. Placement is enabled only when both core classes are present and is disabled with `--no-qos-placement`.
 
-### Three-Region Control
-
-| Delay region | Condition | Action |
+| Tier | Balanced / performance | Powersave |
 | :--- | :--- | :--- |
-| Low | delay < `tlow_ns` (5 ms) | Gain += `gain_step` (32). Reset HAI streak. Slices grow: less preemption overhead. |
-| Mid — rising | `tlow` ≤ delay ≤ `thigh`, gradient > `margin` | Gain × `backoff_gradient` (0.969×). Mild backoff before congestion peaks. |
-| Mid — falling | `tlow` ≤ delay ≤ `thigh`, gradient < −`margin` | If gain ≥ recovery floor, gain += `gain_step/2`. Controlled recovery. |
-| High | delay > `thigh_ns` (50 ms) | Gain × `backoff_high` (0.937×). Slices shrink: more preemption, better fairness. |
+| Interactive | Big cores first | Big cores first |
+| Default | Big cores first | Big cores first |
+| Utility | Big cores first | Little cores first |
+| Background | Little cores first | Little cores only |
 
-### High-Activity-Index (HAI) Streak
+### Idle CPU Selection
 
-When gain drops below `hai_thresh` (768, or 0.75×) due to sustained high delay, a streak counter increments each control interval. When the streak reaches `hai_multiplier` (2), the gain is halved and the streak resets. This catches persistent congestion that the per-interval backoff alone would only gradually resolve.
+Performance-first tiers look for a whole idle big core, then a little core, then any idle CPU. Efficiency-first tiers look for a little core (lowest capacity first), then, unless confined, an idle SMT sibling of an already awake core, then any CPU. The previous CPU is tried first. The default scan walks CPUs in capacity order; `--no-preferred-idle-scan` uses the kernel's topology-aware `scx_bpf_select_cpu_and()` with the same core-class masks instead.
 
-### Delay Measurement
+### Shared Queues
 
-Queue delay = time from `timely_last_enqueued_at` (set at enqueue) to the moment the task begins running. Both a delay EWMA (α = 1/4) and a gradient EWMA track the signal. All TIMELY state is per-task and adds no contention between tasks on different CPUs.
+The tier queues are shared by both core classes. A big core consumes background work only when no other tier has queued work, so background tasks cannot take big cores while foreground work waits on little ones.
+
+### Quantum-Expiry Rebalancing
+
+At every slice expiry, a task on the wrong core class is moved, as in XNU's AMP/Edge rebalancing:
+
+- **Up**: work that prefers big cores, running on a little core, moves to an idle whole big core. If there is none, it takes a big core that is running little-core work; the displaced task goes back to its tier queue for a little core to pick up.
+- **Down**: work that prefers little cores, running on a big core, moves to an idle little core.
+- **SMT**: a task whose SMT sibling is busy moves to a whole idle core of the same class.
 
 ---
 
-## 6. Power Management
+## 7. Power Management
 
-### E-Core Idle Consolidation
+### Power Modes
 
-When `nr_running < 75% × nr_online_cpus` (lightly loaded), tasks of **all tiers** avoid efficiency cores during idle CPU selection. If the only available idle CPU is an E-core, the task queues to the tier DSQ rather than waking that core. This allows E-cores to remain in deep C-states (C6 on Intel ~130 µs exit latency, CC6 on AMD ~150 µs) during periods of light activity.
+`--power-mode auto` (default) follows power-profiles-daemon over D-Bus and falls back to the cpufreq energy performance preference or governor name when the daemon is not running. A profile change is applied in place within one second, without restarting the scheduler. If nothing reports a profile, auto uses balanced.
 
-The threshold is intentional — at 75% load the system is no longer lightly loaded and E-core avoidance stops, so there is no throughput cost under sustained workloads.
+| Mode | Interactive frequency floor | Utility cap | Background cap | Background confined to little cores | Utility prefers little cores |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Performance | 100% | none | none | No | No |
+| Balanced | 75% | none | 50% | No | No |
+| Powersave | 50% | 75% | 37.5% | Yes | Yes |
 
-### Passive Rebalance
+Floors and caps are fractions of each CPU's maximum frequency and apply only while a task of that tier runs on the CPU.
 
-Consolidation only governs *new* placements — it does not by itself move work that already landed on an E-core before consolidation kicked in. To close that gap, when a performance core finds nothing of its own to dispatch while consolidation is active, it checks every efficiency core's per-CPU dispatch queue and claims any task waiting there before going idle.
+### Frequency Control
 
-This is deliberately passive: it never sends an IPI or kick to the efficiency core, and it never touches a task that is already running — it only reclaims queued (not yet running) work, using the same dispatch-queue move primitive the scheduler already uses for its own per-CPU queue. The effect is that a P-core finishing its own work absorbs spillover from an E-core instead of letting that E-core stay powered to finish it, while the P-core would otherwise have gone idle regardless.
+> [!IMPORTANT]
+> Frequency control only takes effect with the **schedutil** governor: amd-pstate or intel_pstate in passive mode, or amd-pstate in guided mode. With amd-pstate or intel_pstate in active (EPP) mode the hardware picks frequencies itself and the power mode only affects placement.
 
-### CPU Frequency Scaling
+Each CPU folds its busy time into a utilisation estimate every 4 ms:
 
-The scheduler drives per-CPU frequency via `scx_bpf_cpuperf_set` based on measured utilisation:
+- **Frequency-invariant**: busy time is weighted by the current frequency (`scx_bpf_cpuperf_cur()`), so utilisation means "fraction of this CPU at maximum frequency"
+- **Fast attack**: the estimate moves halfway to a higher sample at once
+- **Proportional decay**: it falls by 1/8 of the gap per elapsed 4 ms window, up to the full gap after 32 ms
+- **Saturation boost**: a CPU busy for at least 7/8 of a window at its current frequency is pushed halfway toward maximum, since its real demand is unknown
 
-```
-utilisation = (on_cpu_ns / elapsed_ns) × SCX_CPUPERF_ONE
-```
-
-`on_cpu_ns` accumulates actual per-task runtime, so this tracks genuine CPU business rather than wall-clock time since the last sample. Utilisation ≥ 75% snaps to maximum frequency; below that, frequency tracks utilisation proportionally.
-
-The sampling window resets — rather than being averaged against — whenever more than 32 ms has elapsed since the previous sample, requesting full performance for that one sample instead of computing a ratio. This covers both the very first measurement and any CPU waking from a long idle stretch: without the reset, a long idle gap would dilute a freshly-started burst toward an artificially low utilisation reading and under-clock exactly the CPU that just woke up to do something, which is the opposite of what you want right when responsiveness matters most.
-
-When `--timely` is enabled, both mechanisms are active simultaneously: frequency scales the CPU's absolute speed; the TIMELY gain scales the scheduling quantum length. They address different axes and do not interfere.
+The estimate is scaled by CPU capacity, because schedutil reads the target as utilisation in capacity units and the tier's floor or cap is applied. schedutil adds 25% headroom to everything it reads, so floors and caps are set at 4/5 of their nominal value to land on the frequency in the table. `--no-cpufreq` pins the target at maximum instead.
 
 ### Idle Resume Latency
 
-By default, a 1000 µs PM QoS latency constraint is applied to every CPU in the primary domain. This permits deep C-states whose exit latency is below 1 ms (C6/CC6 on most current laptop silicon) while blocking pathological deep states (C10, PC10) with exit latencies of 500 µs–2 ms that add visible latency to interactive events.
-
-CPUs outside the primary domain receive no scheduler-imposed QoS constraint at all. Those are the CPUs E-core consolidation is actively trying to keep idle, so capping their allowed resume latency at the same ~1 ms as the interactive cores would work against the whole point of consolidating onto fewer cores — including, on platforms where package-level idle requires every core to be deep enough, blocking full package idle even while the system is otherwise quiet. Leaving them unconstrained lets the platform's own cpuidle governor pick the deepest state actual idle duration justifies.
-
-Restored to hardware default on scheduler exit.
+Off by default. `-I <us>` limits the idle-state exit latency of the primary-domain CPUs, excluding idle states that take longer to exit. The limit is applied after the scheduler has attached and restored when it exits or fails. On current laptop CPUs the deepest core C-states exit in a few hundred microseconds, so a low limit costs battery and a high one does nothing.
 
 ---
 
-## 7. Architecture
+## 8. Adaptive Time Slices (TIMELY)
 
-### Hook Sequence
+Enabled with `--timely`. The structure follows TIMELY (Mittal et al., SIGCOMM 2015), with a task's queueing delay in place of network RTT. Each task has a gain in `[gain_min, 1024]` (0.125–1.0 by default) that multiplies its slice.
+
+The queueing delay is the time from enqueue to running; its gradient is an EWMA (α = 1/4) of the change between samples. The gain is updated at most once per control interval (500 µs):
+
+| Region | Condition | Gain update |
+| :--- | :--- | :--- |
+| Low delay | delay < `tlow` (5 ms) | `gain += step` (32) |
+| High delay | delay > `thigh` (50 ms) | `gain *= 1 − β × (1 − thigh / delay)` |
+| Falling or flat | gradient ≤ 0 | `gain += step`, or `step × hai_multiplier` (2) after `hai_thresh` (5) consecutive samples (hyperactive increase) |
+| Rising | gradient > 0 | `gain *= 1 − β × min(gradient / margin, 1)` |
+
+β defaults to 819/1024 (0.8) and the gradient margin to 125 µs. All TIMELY state is per-task.
+
+---
+
+## 9. Architecture
+
+### Callbacks
 
 ```
-select_cpu → sample enqueue_ts, classify tier, pick idle CPU, direct-dispatch if idle
-enqueue    → sample enqueue_ts, tier DSQ insert, kick at most one CPU so dispatch runs promptly for T0
-dispatch   → warp budget check → starvation check → EDF across all DSQs → E-core rebalance pull → keep_running
-running    → sample delay, update TIMELY gain, advance vtime_now from raw vtime
-stopping   → advance vruntime, update cpufreq utilisation, update group score
-runnable   → update wakeup_freq EWMA, accumulate group blocked time
-exit_task  → delete group score map entry when last thread exits
+select_cpu  re-classify, pick an idle CPU by tier and core class, direct-dispatch if found
+enqueue     consume a migration claim, resume a preempted task, re-enqueue after RT,
+            sticky and per-CPU placement, idle CPU, interactive preemption, tier queue + kick
+dispatch    charge prev, re-classify, quantum-expiry rebalance, root-bucket selection,
+            keep prev or consume a tier
+running     tier clock, TIMELY sample, running-tier gauge, frequency target
+stopping    charge runtime, close the CPU's utilisation interval
+runnable    group runnable count and blocked time; on wakeup: burst average, wakeup rate
+quiescent   group runnable count, start of blocked interval
+cpu_release re-enqueue the local queue (kernels without the any-context kfunc)
 ```
 
-### Key Data Structures
+### Data Structures
 
-| Structure | Purpose |
-| :--- | :--- |
-| `task_ctx` | Per-task: vruntime, wakeup\_freq, avg\_runtime, tier, TIMELY gain/delay/gradient/HAI |
-| `cpu_ctx` | Per-CPU: runtime accumulators, frequency tracking, SMT sibling mask |
-| `group_iact` | Per-tgid: cpu\_used\_ns, blocked\_accum\_ns, score, tier, decay generation counter |
-
-Warp budgets and starvation-avoidance window state are tracked globally per tier (shared across CPUs), not per-CPU — both mechanisms refill or reset based on which tier wins dispatch, not on which CPU happens to be running it.
+| Structure | Storage | Contents |
+| :--- | :--- | :--- |
+| `task_ctx` | task storage | tier, burst and average burst, wakeup rate, sleep credit, TIMELY gain and delay state |
+| `cpu_ctx` | per-CPU array | utilisation window, frequency target, running tier and pid, slice end, resume and migration claims, SMT sibling mask |
+| `group_ctx` | LRU hash (8192, by tgid) | leader start time, CPU used, blocked time, runnable threads, score |
+| `root_bkt[4]` | global, spin lock | deadline, warp remaining, warp window, starvation window per tier |
 
 ### DSQ Layout
 
-| ID range | Purpose |
+| ID | Purpose |
 | :--- | :--- |
-| `[0 .. nr_cpu_ids)` | Per-CPU DSQs for direct dispatch (sticky, kthread, pcpu, idle-found paths) |
-| `nr_cpu_ids + 0` | TIER\_INTERACTIVE global DSQ |
-| `nr_cpu_ids + 1` | TIER\_DEFAULT global DSQ |
-| `nr_cpu_ids + 2` | TIER\_BACKGROUND global DSQ |
-
-Cross-tier EDF ordering is a plain `u64` comparison: `tier_vtime_base` offsets (0 / 400 ms / 800 ms) are baked into `dsq_vtime` at enqueue and stripped at stopping, so no per-dispatch branching is needed to enforce tier priority.
-
----
-
-## 8. Default Preset
-
-Running `scx_aura` with no arguments loads a laptop-optimised preset. Every value is individually overridable.
-
-| Setting | Preset value | Upstream default | Reason |
-| :--- | :--- | :--- | :--- |
-| Max slice | 800 µs | 1000 µs | More scheduling opportunities for interactive tasks |
-| Primary domain | Performance cores | auto | P-cores preferred on hybrid CPUs, works with E-core consolidation |
-| Sticky tasks | On | Off | Short-runtime tasks stay on warm cache |
-| CPU frequency | Auto (utilisation-based) | Off | Frequency tracks load without governor |
-| Idle resume latency | 1000 µs | Disabled | Permits C6, blocks C10 |
-| Preferred idle scan | On | Off | Capacity-sorted idle selection for deterministic P-core preference |
-| Group interactivity | On | — | Per-process scoring active |
-| Warp budget | On | — | Per-tier depleting preemption budget active (`--no-warp` to disable) |
-| E-core consolidation + rebalance | On | — | Active below 75% system load; idle P-cores reclaim E-core spillover |
-| Adaptive slices (TIMELY) | Off | Off | Opt-in with `--timely` |
+| `SCX_DSQ_LOCAL` / `SCX_DSQ_LOCAL_ON` | Direct dispatch, resumes, interactive preemption, migrations |
+| `0x100` | Interactive tier |
+| `0x101` | Default tier |
+| `0x102` | Utility tier |
+| `0x103` | Background tier |
 
 ---
 
-## 9. Options
+## 10. Options
 
 ```
-# Core scheduling
--s <us>                             Maximum time slice (default: 800 µs)
--L <us>                             Minimum time slice (default: 0, disabled)
--l <us>                             Slice lag window (default: 40000 µs)
--t <us>                             Throttle CPUs by periodically injecting idle cycles (default: 0, disabled)
--I <us>                             Idle resume latency QoS (-1 to disable; default: 1000 µs)
--m <domain>                         Primary CPU domain: auto / performance / powersave / turbo / bitmask
+Scheduling
+-s, --slice-us <us>                 Maximum slice; latency bounds, warp and windows scale with it (default: 800)
+-L, --slice-min-us <us>             Minimum slice (default: 250)
+-l, --slice-us-lag <us>             Maximum sleep credit (default: 40000)
+-t, --throttle-us <us>              Inject idle cycles periodically (default: 0, disabled)
+-m, --primary-domain <domain>       Hex cpumask, or auto / performance / powersave / turbo / all (default: performance)
+-k, --local-kthreads                Dispatch per-CPU kthreads locally (experimental)
+-w, --no-wake-sync                  Ignore synchronous wakeups (kernel idle CPU selection only)
+    --disable-smt                   Disable SMT awareness
+    --disable-numa                  Disable NUMA awareness
 
-# Opt-in behaviour
--k                                  Enable per-CPU kthread prioritization (experimental)
--w                                  Disable direct dispatch during synchronous wakeups
---disable-smt                       Disable SMT awareness
---disable-numa                      Disable NUMA awareness
+Power
+    --power-mode <mode>             auto / performance / balanced / powersave (default: auto)
+    --little-cpus <mask|none>       Override detected efficiency cores
+-I, --idle-resume-us <us>           Idle resume latency limit on the primary domain (default: -1, disabled)
+    --no-cpufreq                    Do not drive CPU frequency (pins schedutil at maximum)
 
-# Adaptive time-slice feedback (TIMELY) — all tunables below only apply with -T
--T / --timely                       Enable adaptive time-slice feedback
---timely-tlow-us <us>               Low-delay threshold (default: 5000 µs)
---timely-thigh-us <us>              High-delay threshold (default: 50000 µs)
---timely-gain-min <fp>              Minimum gain, fixed-point (default: 128)
---timely-gain-step <fp>             Gain step per interval, fixed-point (default: 32)
---timely-hai-thresh <fp>            HAI streak-tracking threshold, fixed-point (default: 768)
---timely-hai-multiplier <n>         HAI streak length before an extra gain halving (default: 2)
---timely-backoff-low <fp>           Mid-region recovery-floor factor, fixed-point (default: 768)
---timely-backoff-high <fp>          High-delay backoff factor, fixed-point (default: 960)
---timely-backoff-gradient <fp>      Rising-gradient backoff factor, fixed-point (default: 992)
---timely-gradient-margin-us <us>    Minimum gradient to count as rising/falling (default: 125 µs)
---timely-control-interval-us <us>   How often gain is recomputed per task (default: 500 µs)
+Feature opt-outs
+    --no-sticky-tasks               Disable sticky tasks
+    --no-local-pcpu                 Queue single-CPU tasks in their tier
+    --no-preferred-idle-scan        Use the kernel's idle CPU selection
+    --no-group-iact                 Disable thread-group interactivity scoring
+    --no-qos-placement              Disable core-type placement (alias: --no-ecore-consolidate)
+    --no-warp                       Disable warp
 
-# Laptop preset opt-outs
---no-sticky-tasks                   Disable sticky task dispatch
---no-local-pcpu                     Disable per-CPU task local dispatch
---no-preferred-idle-scan            Disable capacity-sorted idle CPU selection
---no-cpufreq                        Disable scheduler-driven frequency scaling
---no-group-iact                     Disable per-process interactivity scoring
---no-warp                           Disable per-tier warp budget (EDF-only ordering, no preemption)
---no-ecore-consolidate              Disable E-core idle consolidation
+TIMELY (only with -T)
+-T, --timely                        Enable adaptive time slices
+    --timely-tlow-us <us>           Low delay threshold (default: 5000)
+    --timely-thigh-us <us>          High delay threshold (default: 50000)
+    --timely-gain-min <fp>          Minimum gain, 1024 = 1.0 (default: 128)
+    --timely-gain-step <fp>         Additive step (default: 32)
+    --timely-hai-thresh <n>         Non-rising samples before hyperactive increase (default: 5)
+    --timely-hai-multiplier <n>     Step multiplier in hyperactive increase (default: 2)
+    --timely-beta <fp>              Multiplicative decrease factor, 819 = 0.8 (default: 819)
+    --timely-gradient-margin-us <us> Gradient normalisation (default: 125)
+    --timely-control-interval-us <us> Minimum interval between gain updates (default: 500)
 
-# Diagnostics & stats
---exit-dump-len <n>                 Exit debug dump buffer length (default: 0, use kernel default)
--d                                  Enable BPF debug output via trace_pipe
--v                                  Verbose output including libbpf details
--V / --version                      Print version and exit
---help-stats                        Show descriptions for statistics fields
---stats <intv>                      Live statistics at the given interval (seconds)
---monitor <intv>                    Statistics monitoring only (no scheduler)
+Diagnostics
+    --stats <sec>                   Run with live statistics
+    --monitor <sec>                 Statistics only, scheduler not launched
+    --help-stats                    Describe the statistics fields
+    --exit-dump-len <n>             Exit dump buffer length (default: 0, kernel default)
+-d, --debug                         BPF debug output to /sys/kernel/tracing/trace_pipe
+-v, --verbose                       Verbose output including libbpf
+-V, --version                       Print version
 ```
 
 ---
 
-## 10. Overhead
+## 11. Statistics
 
-The overhead relative to a minimal sched_ext skeleton is concentrated in `enqueue`, `select_cpu`, and `dispatch`. Unlike earlier revisions, `dispatch` is no longer a thin wrapper around upstream `scx_bpfland`'s loop — the warp-budget accounting, the bounded starvation window, and the E-core rebalance pull all run there. Compiled with `clang -O2 -target bpf`, `dispatch` is the largest callback in the scheduler at roughly 1000 BPF instructions, still well within normal range for this class of program and with no observed verifier-complexity warnings under `-Wall -Wextra`.
+`--stats 1` prints one line per interval. Counters are per interval; `r` and `run` are sampled.
 
-| Function | Added cost | Notes |
-| :--- | :--- | :--- |
-| `select_cpu` | +1 ktime call | `enqueue_ts` sampled once; reused for TIMELY and warp |
-| `enqueue` | +2–4 DSQ nr\_queued calls | For starvation enforcement; zero when tier DSQs are empty |
-| `dispatch` | +4 DSQ peek calls, up to 2 deadline-min comparisons per warp attempt, a bounded CAS retry (≤16 iterations) when warp budget is actually spent, and — only when a P-core is otherwise about to idle during consolidation — a bounded scan of efficiency-core queues | Warp and starvation checks are skipped entirely when the relevant tier DSQs are empty; the rebalance scan only runs on the idle-fallback path, not on every dispatch call |
-| `running` | +1 TIMELY sample | Only when `timely_enabled`; no-op otherwise |
-| `stopping` | +1 map lookup | Group interactivity score update (hash map, ~5 ns) |
-| `exit_task` | +1 map delete | Only on last thread exit of a process |
+```
+[scx_aura] r: 4/4  bal run i0 d1 u2 b1 | enq i:12 d:48 u:6 b:24 | disp ... | sel nat:1305 warp:3 starve:2/0 | kick:13 mig ^2 v0 smt:0 | tier ^4 v4 | keep:1223 direct:9 local:31
+```
 
-All per-task TIMELY state shares the `task_ctx` allocation with the core scheduling fields. No additional per-task allocations are introduced. Warp and starvation-avoidance state are small fixed-size global arrays (one entry per tier), not per-task or per-CPU allocations.
+| Field | Meaning |
+| :--- | :--- |
+| `r: 4/4` | Running tasks / online CPUs |
+| `bal` | Active power mode (`perf`, `bal`, `save`) |
+| `run i d u b` | CPUs running each tier at sample time (includes the stats reader itself) |
+| `enq`, `disp` | Tier queue enqueues and dispatches per tier |
+| `sel nat warp starve:o/s` | Root-bucket selections: natural order, warp, starvation windows opened / selections inside one |
+| `kick` | Interactive preemptions |
+| `mig ^ v smt` | Quantum-expiry moves up to big cores (including swaps), down to little cores, away from busy SMT siblings |
+| `tier ^ v` | Tier promotions and demotions |
+| `keep`, `direct`, `local` | Slice refills, direct placements on idle CPUs, local-queue inserts (sticky, per-CPU, resumes) |
+
+With `--timely`, a second line counts additive increases, multiplicative decreases and hyperactive increases.
 
 ---
 
-## 11. Vocabulary
+## 12. Overhead
+
+BPF instruction counts with clang 20 at `-O2`:
+
+| Program | Instructions |
+| :--- | :--- |
+| `dispatch` | 1361 |
+| `enqueue` | 841 |
+| `running` | 249 |
+| `runnable` | 166 |
+| `select_cpu` | 84 |
+| `stopping` | 61 |
+| `quiescent` | 48 |
+| Shared subprograms | 1279 |
+
+- **Root-bucket selection**: takes one global spin lock per dispatch, plus one when a tier becomes runnable. Four DSQ length reads per dispatch decide which tiers are candidates.
+- **Group scoring**: one hash lookup per classification and per runtime charge.
+- **CPU scans**: preemption target selection and big/little swaps scan at most `nr_cpus` entries and only when no idle CPU is available. Swaps run only on hybrid CPUs.
+- **Frequency**: `scx_bpf_cpuperf_set()` is called only when the target changes.
+
+---
+
+## 13. Vocabulary
 
 ### Scheduling
 
 | Term | Definition |
 | :--- | :--- |
-| **Tier** | Priority level (T0–T2). Controls dispatch order, starvation budget, and vtime offset. |
-| **Vtime** | Virtual runtime used as DSQ sort key. Includes tier offset so cross-tier comparison needs no branching. |
-| **Lag** | Credit given to sleeping tasks: the more a task sleeps, the earlier its vtime deadline relative to CPU-bound peers. |
-| **Starvation budget** | Maximum wall-clock time a tier's head task can wait before triggering starvation avoidance — unconditional if nothing higher is runnable, otherwise a bounded window. |
-| **Warp budget** | Per-tier allowance (shared across CPUs) that lets a tier jump ahead of lower tiers in EDF. Drains while spent; refills only on a fair (non-warp, non-starvation-override) win. |
-| **Starvation-avoidance window** | The single bounded quantum (1 ms) a tier is granted when its latency budget expires while a higher tier is also runnable. Re-opens if the tier is still starved afterward; tracked per tier, not per-CPU. |
-| **Interactivity score** | Per-process 0–16 value derived from `blocked / (blocked + cpu_used)`. High score → interactive. |
-| **Decay generation** | Integer counter tracking how many 500 ms windows have elapsed; used to gate score decay to once per window. |
-| **Gain** | Fixed-point TIMELY multiplier in [128..1024] applied to `slice_max` to produce the per-task slice. |
-| **HAI streak** | Count of consecutive TIMELY control intervals where gain remained below 75% of max. |
-| **EWMA** | Exponential Weighted Moving Average. Used for wakeup\_freq, queue delay, and gradient. |
+| **Tier** | QoS class (Interactive, Default, Utility, Background); decides root bucket, core class and frequency policy |
+| **Root bucket** | XNU's per-QoS scheduling entity; here, one per tier with a deadline, warp budget and starvation window |
+| **WCEL** | Worst-case execution latency: how long a runnable tier may wait before its deadline expires |
+| **Warp** | Budget that lets a higher tier run ahead of the earliest-deadline tier; spent in wall time, refilled only by a natural-order selection |
+| **Starvation-avoidance window** | One tier quantum during which an expired lower tier is selected even though a higher tier is runnable |
+| **Burst** | CPU time a task uses between two wakeups |
+| **Wakeup rate** | EWMA of wakeups per 100 ms |
+| **Interactivity score** | Per-process 0–16 value from blocked versus used CPU time; 16 is fully interactive |
+| **Lag** | Sleep credit that pulls a task's virtual deadline earlier, bounded by `slice_lag` |
+| **Resume** | A task that lost its CPU to a preemption or a lower tier's turn continues on the same CPU right after |
+| **Gain** | TIMELY slice multiplier in `[gain_min, 1024]` |
 
 ### Hardware
 
 | Term | Definition |
 | :--- | :--- |
-| **P-core** | Performance core — higher cpu\_capacity, higher power draw. |
-| **E-core** | Efficiency core — lower cpu\_capacity, lower power draw, capable of deep C-states. |
-| **C-state** | CPU idle power state. Deeper states save more power but have longer exit latencies. |
-| **C6/CC6** | Deep idle state on Intel/AMD (~130–150 µs exit latency). Permitted by the 1000 µs latency QoS preset. |
-| **C10/PC10** | Very deep package idle state (500 µs–2 ms exit latency). Blocked by the 1000 µs preset. |
-| **LLC** | Last Level Cache. Cores sharing an LLC have lower inter-core communication latency. |
-| **SMT** | Simultaneous Multi-Threading. Two logical CPUs per physical core; aura avoids placing a task on an SMT sibling whose physical core is already active when a fully-idle core is available. |
-| **EPP** | Energy Performance Preference. Linux kernel attribute used to identify P-core and E-core rankings for primary domain selection. |
+| **Big / P-core** | Performance core: higher capacity and power draw |
+| **Little / E-core** | Efficiency core: lower capacity and power draw |
+| **SMT** | Two logical CPUs per physical core; whole idle cores are preferred |
+| **EPP** | Energy performance preference, the cpufreq hint used by `--power-mode auto` without power-profiles-daemon |
+| **schedutil** | cpufreq governor that reads the scheduler's frequency target |
 
 ### Research Sources
 
 | Feature | Derived from |
 | :--- | :--- |
-| Vruntime EDF with lag-based interactivity | scx\_bpfland |
-| Three-tier classification with per-process scoring | XNU Clutch scheduler concepts (Apple open-source) |
-| Delay-driven adaptive slice feedback | TIMELY research (SIGCOMM 2015 — Swift congestion control adapted for CPU scheduling) |
-| Depleting per-tier warp budget | XNU root-bucket warp mechanism (`scrb_warp_remaining`), including its fairness-gated refill |
-| Bounded starvation-avoidance window | XNU WCEL (Worst-Case Execution Latency) per-bucket guarantees, including the one-quantum starvation-avoidance window in `sched_clutch_root_highest_root_bucket()` |
-| E-core idle consolidation | XNU AMP spill/consolidation (inverted for power saving) |
-| Passive E-core → P-core rebalance | XNU `sched_amp_balance()` |
-| Per-CPU SMT-aware idle selection | scx\_bpfland preferred idle scan |
+| Virtual deadline with sleep credit, idle selection | scx_bpfland |
+| Root-bucket EDF, warp, starvation avoidance | XNU `sched_clutch.c`, `sched_clutch_root_highest_root_bucket()` |
+| Thread-group interactivity score and decay | XNU `sched_clutch_interactivity_from_cpu_data()` |
+| Core-class placement and quantum-expiry rebalancing | XNU AMP and Edge schedulers (`sched_amp.c`) |
+| QoS-based frequency floors and caps | Apple CLPC behaviour, via schedutil |
+| Delay-driven slice gain | TIMELY (Mittal et al., SIGCOMM 2015) |
